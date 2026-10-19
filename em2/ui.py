@@ -833,7 +833,8 @@ class Window(W.QMainWindow):
         self.enable_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"])
         self.pause_button.setEnabled(s["enabled"] or bool(s["active"]))
         self.filename.setText(Path(s["path"]).name if s["path"] else "—")
-        status = STATE_ZH.get(s["state"], s["state"]) if zh else s["state"].replace("_", " ")
+        phase = s["phase"] if s["active"] and s["phase"] != "idle" else s["state"]
+        status = STATE_ZH.get(phase, phase) if zh else phase.replace("_", " ")
         detail = (f"{status}  ·  目标 {fmt(s['target'])}  ·  混合剩余 {s['mix_remaining']:.1f} s  ·  设置 v{s['settings']['version']}" if zh else
                   f"{status}  ·  Target {fmt(s['target'])}  ·  Mix {s['mix_remaining']:.1f} s  ·  Settings v{s['settings']['version']}")
         self.monitor_status.setText(detail+("  ·  "+s["pending_reason"] if s["pending_reason"] else ""))

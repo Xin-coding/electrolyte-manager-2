@@ -133,7 +133,7 @@ class Engine:
         self.emit("settings_requested", {"old": old, "new": settings.payload()})
         # Record-only metadata is immediate even while operational changes wait.
         self.settings.metadata = dict(settings.metadata)
-        if self.active or now < self.ready_at:
+        if self.active or self.enabled and now < self.ready_at:
             self.pending_settings = settings
         else:
             self._activate(settings)

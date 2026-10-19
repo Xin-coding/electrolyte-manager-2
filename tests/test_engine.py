@@ -186,3 +186,14 @@ def test_target_band_boundary(value):
     e = engine()
     sample(e, value, 1, 1)
     assert not e.tick(1)
+
+
+def test_paused_settings_apply_immediately_without_shortening_mix():
+    e = engine()
+    e.ready_at = 100
+    e.pause()
+    new = Settings.from_dict(e.settings.payload())
+    new.mix_s = 1
+    e.apply(new, 80)
+    assert e.pending_settings is None and e.settings.mix_s == 1
+    assert e.ready_at == 100 and not e.enabled
