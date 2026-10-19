@@ -1,6 +1,8 @@
-# Validation status — 2.0.1
+# Validation status — 2.0.2
 
 This document distinguishes executable software checks, instrument evidence and checks that require more elapsed time or external measurement.
+
+Version 2.0.2 adds 43 input-protection regressions, bringing the suite to 126 passing tests. Tests prohibit physical serial access and verify malformed/range/precision errors, bilingual inline messages, cross-field alarm and STOP limits, partial presets, and unchanged effective/pending settings, consumption and full mixing deadline after rejected drafts. Existing pump packet and feedback tests remain included. No additional physical injections were required for this form change; the 2.0.1 bench evidence remains historical evidence, not a new hardware test. See [2.0.2 changes](CHANGES_2_0_2.md).
 
 Version 2.0.0 was approved for general release on 2026-10-19. Release status does not change the validation results below.
 

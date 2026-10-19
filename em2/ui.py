@@ -16,6 +16,7 @@ from . import storage
 from . import __version__
 from .devices.sensors import ports
 from .models import Settings, Dose
+from . import forms
 from .paths import atomic_json, read_json
 from .units import hydroxide
 
@@ -40,6 +41,8 @@ QPushButton#primary:disabled, QPushButton#danger:disabled { background: #edf1f5;
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
  background: white; border: 1px solid #c9d7e3; border-radius: 4px; padding: 5px; }
 QLineEdit:focus, QComboBox:focus { border-color: #087ba9; }
+QLineEdit[invalid="true"], QLineEdit[invalid="true"]:focus { border: 2px solid #b83645; background: #fff5f5; }
+QLabel#fieldError { color: #a82033; font-size: 9pt; }
 QListWidget#navigation { background: #132f48; border: none; padding: 9px; color: #d9e7f2; }
 QListWidget#navigation::item { color: #d9e7f2; padding: 16px 9px; margin: 3px 0; border-radius: 5px; }
 QListWidget#navigation::item:selected { background: #17678d; color: white; }
@@ -89,11 +92,39 @@ def layout_row(*widgets):
     return row
 
 
+class NumericEdit(W.QLineEdit):
+    """Keep drafts editable; report errors on blur or explicit submission."""
+    def __init__(self):
+        super().__init__()
+        self.reviewed = False
+        self.issue = None
+        self.error_label = W.QLabel()
+        self.error_label.setObjectName("fieldError")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        self.container = W.QWidget()
+        column = W.QVBoxLayout(self.container)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(3)
+        column.addWidget(self)
+        column.addWidget(self.error_label)
+
+    def show_issue(self, issue, language):
+        self.issue = issue
+        message = issue[0 if language == "zh" else 1] if issue else ""
+        self.error_label.setText(message)
+        self.error_label.setVisible(bool(issue))
+        self.setAccessibleDescription(message)
+        invalid = bool(issue)
+        if self.property("invalid") != invalid:
+            self.setProperty("invalid", invalid)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+
 def line_number(placeholder="", width=None):
-    edit = W.QLineEdit()
-    validator = G.QDoubleValidator(-1e9, 1e9, 8, edit)
-    validator.setLocale(C.QLocale.c())
-    edit.setValidator(validator)
+    edit = NumericEdit()
     edit.setPlaceholderText(placeholder)
     if width:
         edit.setMaximumWidth(width)
@@ -101,8 +132,10 @@ def line_number(placeholder="", width=None):
 
 
 def number(edit):
-    value = edit.text().strip()
-    return float(value) if value else None
+    value, issue = forms.parse_number(edit.text())
+    if issue:
+        raise ValueError(" / ".join(issue))
+    return value
 
 
 def fmt(value, digits=3):
@@ -232,6 +265,8 @@ class Window(W.QMainWindow):
     def guard(self, callback):
         try:
             return callback()
+        except forms.FormError:
+            pass  # The invalid fields already contain actionable explanations.
         except Exception as exc:
             W.QMessageBox.warning(self, "Electrolyte Manager", str(exc))
 
@@ -264,6 +299,62 @@ class Window(W.QMainWindow):
             getattr(obj, setter)(zh if self.language == "zh" else en)
         for i, (zh, en) in enumerate(self.page_names):
             self.navigation.item(i).setText(zh if self.language == "zh" else en)
+        for edit in self.numeric_edits():
+            edit.show_issue(edit.issue, self.language)
+
+    def numeric_edits(self):
+        return [*self.settings_edits().values(), *self.test_edits().values(), self.allowance]
+
+    def settings_edits(self):
+        return {**self.fields, **{f"{kind}.{key}": edit for kind, fields in self.signal_fields.items()
+                                 for key, edit in fields.items() if key != "direction"}}
+
+    def test_edits(self):
+        return {"volume_ml": self.test_volume, "flow_ml_min": self.test_flow,
+                "force_percent": self.test_force, "hardware_cap_ml": self.test_cap}
+
+    def watch_number(self, edit, validate):
+        def finished():
+            edit.reviewed = True
+            validate()
+        edit.editingFinished.connect(finished)
+
+    def show_field_errors(self, edits, errors, all_fields=False, focus=False):
+        for key, edit in edits.items():
+            if all_fields:
+                edit.reviewed = True
+            edit.show_issue(errors.get(key) if edit.reviewed else None, self.language)
+        if focus and errors:
+            edit = edits[next(key for key in edits if key in errors)]
+            edit.setFocus()
+            # Settings lives in a scroll area; make the field and reason visible.
+            if self.pages.currentIndex() == 2:
+                self.pages.widget(2).ensureWidgetVisible(edit.container)
+
+    def validate_settings_form(self, all_fields=False, complete=None):
+        if complete is None:
+            complete = self.runtime.snapshot.get("enabled", False)
+        edits = self.settings_edits()
+        values, errors = forms.settings_fields({k: e.text() for k, e in edits.items()}, self.control.currentData(), complete,
+                                               self.runtime.snapshot.get("hardware", {}).get("capacity_ml"))
+        self.show_field_errors(edits, errors, all_fields, focus=all_fields)
+        self.draft_notice.setVisible(any(e.issue for e in edits.values()))
+        return values, errors
+
+    def validate_test_form(self, stop_test=None, submit=False):
+        snap = self.runtime.snapshot
+        values, errors = forms.test_fields({k: e.text() for k, e in self.test_edits().items()}, stop_test, submit,
+                                          snap.get("hardware", {}).get("capacity_ml"), snap.get("remaining"))
+        edits = self.test_edits()
+        if stop_test is False:
+            edits.pop("hardware_cap_ml")
+        self.show_field_errors(edits, errors, submit, focus=submit)
+        return values, errors
+
+    def validate_allowance(self):
+        value, issue = forms.allowance_field(self.allowance.text())
+        self.allowance.show_issue(issue, self.language)
+        return value, issue
 
     def build_connections(self):
         page = W.QWidget()
@@ -356,7 +447,8 @@ class Window(W.QMainWindow):
                               ("注射速率 (mL/min)", "Flow (mL/min)", self.test_flow),
                               ("STOP 测试泵端上限 (mL)", "STOP test hardware cap (mL)", self.test_cap),
                               ("测试推力 (%)", "Test force (%)", self.test_force)):
-            form.addRow(self.label(zh, en), field)
+            form.addRow(self.label(zh, en), field.container)
+            self.watch_number(field, self.validate_test_form)
         self.test_cap.setToolTip("STOP 测试：泵端限量必须大于软件停止量。\nThe finite hardware cap must exceed the software cutoff.")
         self.finite_test_button = self.button("单次定量测试", "Run finite dose", lambda: self.start_test(False), "primary")
         self.stop_test_button = self.button("软件 STOP 测试", "Run software STOP test", lambda: self.start_test(True))
@@ -401,15 +493,17 @@ class Window(W.QMainWindow):
         answer = W.QMessageBox.question(self, title, text, W.QMessageBox.StandardButton.Ok | W.QMessageBox.StandardButton.Cancel)
         return signature if answer == W.QMessageBox.StandardButton.Ok else None
 
-    def test_data(self, stop_test):
-        volume, flow, force = number(self.test_volume), number(self.test_flow), number(self.test_force)
-        if None in (volume, flow, force):
-            raise ValueError("Set test volume, flow and integer force")
-        cap = number(self.test_cap) if stop_test else None
-        if stop_test and cap is None:
-            raise ValueError("Set a finite pump hardware cap above the software cutoff")
-        data = {"volume_ml": volume, "flow_ml_min": flow, "force_percent": force,
-                "purpose": "stop_test" if stop_test else "test", "hardware_cap_ml": cap}
+    def test_data(self, stop_test, submit=False):
+        snap = self.runtime.snapshot
+        values, errors = forms.test_fields({k: e.text() for k, e in self.test_edits().items()}, stop_test, True,
+                                          snap.get("hardware", {}).get("capacity_ml"), snap.get("remaining"))
+        if submit:
+            self.validate_test_form(stop_test, submit=True)
+        if errors:
+            issue = next(iter(errors.values()))
+            raise forms.FormError(issue[0 if self.language == "zh" else 1])
+        data = {"volume_ml": values["volume_ml"], "flow_ml_min": values["flow_ml_min"], "force_percent": values["force_percent"],
+                "purpose": "stop_test" if stop_test else "test", "hardware_cap_ml": values.get("hardware_cap_ml")}
         validated = Dose(**data)
         data["force_percent"] = validated.force_percent
         snap = self.runtime.snapshot
@@ -423,7 +517,7 @@ class Window(W.QMainWindow):
         return data
 
     def start_test(self, stop_test):
-        data = self.test_data(stop_test)
+        data = self.test_data(stop_test, submit=True)
         signature = self.confirm_hardware(data)
         if signature:
             self.runtime.command("test", signature=signature, **data)
@@ -452,6 +546,16 @@ class Window(W.QMainWindow):
                          self.button("加载配置", "Load preset", self.load_settings),
                          self.button("读取当前有效设置", "Read effective settings", lambda: self.populate_settings(self.runtime.snapshot["settings"])))
         box.addLayout(bar)
+        self.draft_notice = self.label("草稿有错误：请修改红色字段。尚未提交；当前有效设置和已排队的设置继续保持。",
+                                       "Invalid draft: correct the red fields. Nothing was submitted; effective and pending settings are unchanged.", True)
+        self.draft_notice.setObjectName("fieldError")
+        self.draft_notice.hide()
+        box.addWidget(self.draft_notice)
+        self.feedback_notice = self.label("当前有效配置尚不完整或无效。请应用完整配置后再启用反馈；数据记录可继续。",
+                                          "Effective settings are incomplete or invalid. Apply a complete configuration before enabling feedback; recording can continue.", True)
+        self.feedback_notice.setObjectName("fieldError")
+        self.feedback_notice.hide()
+        box.addWidget(self.feedback_notice)
         self.fields = {}
         group = self.group("正式实验 · 泵设置", "Experiment · Pump settings")
         form = W.QFormLayout(group)
@@ -459,9 +563,11 @@ class Window(W.QMainWindow):
                             ("force_percent", "推力 (%)", "Force (%)"), ("mix_s", "完整混合等待 (s)", "Full mixing wait (s)")):
             field = line_number()
             self.fields[key] = field
-            form.addRow(self.label(zh, en), field)
+            form.addRow(self.label(zh, en), field.container)
+            self.watch_number(field, self.validate_settings_form)
         self.allowance = line_number("mL")
-        allowance_row = layout_row(self.allowance, self.button("更改额度", "Change allowance", lambda: self.set_allowance(False)),
+        self.watch_number(self.allowance, self.validate_allowance)
+        allowance_row = layout_row(self.allowance.container, self.button("更改额度", "Change allowance", lambda: self.set_allowance(False)),
                                   self.button("已换液，重置额度", "Refilled · reset allowance", lambda: self.set_allowance(True)))
         form.addRow(self.label("本次装液可用额度 (mL)", "Current load allowance (mL)"), allowance_row)
         self.load_status = W.QLabel()
@@ -474,7 +580,8 @@ class Window(W.QMainWindow):
         self.control.addItem("Conductivity", "ec")
         form.addRow(self.label("控制信号", "Control signal"), self.control)
         self.fields["ph_interval_s"] = line_number()
-        form.addRow(self.label("pH 采集间隔 (s)", "pH sampling interval (s)"), self.fields["ph_interval_s"])
+        form.addRow(self.label("pH 采集间隔 (s)", "pH sampling interval (s)"), self.fields["ph_interval_s"].container)
+        self.watch_number(self.fields["ph_interval_s"], self.validate_settings_form)
         form.addRow(self.label("电导率采样间隔", "Conductivity sampling interval"), W.QLabel("1 min · instrument setting"))
         self.smoothing = W.QCheckBox("EMA · α = 0.5")
         form.addRow(self.label("平滑显示与正常反馈", "Smooth display and normal feedback"), self.smoothing)
@@ -490,7 +597,8 @@ class Window(W.QMainWindow):
                                 ("lower", "固定下侧报警", "Fixed lower alarm"), ("upper", "固定上侧报警", "Fixed upper alarm")):
                 field = line_number()
                 fields[key] = field
-                form.addRow(self.label(zh, en), field)
+                form.addRow(self.label(zh, en), field.container)
+                self.watch_number(field, self.validate_settings_form)
             direction = W.QComboBox()
             direction.addItem("Low → inject / 低于目标加液", "raise")
             direction.addItem("High → inject / 高于目标加液", "lower")
@@ -517,14 +625,17 @@ class Window(W.QMainWindow):
         box.addWidget(group)
         return scroll
 
-    def collect_settings(self):
+    def collect_settings(self, complete=None):
+        values, errors = self.validate_settings_form(all_fields=True, complete=complete)
+        if errors:
+            raise forms.FormError("Invalid settings draft")
         result = dict(self.runtime.snapshot.get("settings", Settings().payload()))
         for key, edit in self.fields.items():
-            result[key] = number(edit)
+            result[key] = values[key]
         result["control"] = self.control.currentData()
         result["smoothing"] = self.smoothing.isChecked()
         for kind, fields in self.signal_fields.items():
-            result[kind] = {k: (v.currentData() if k == "direction" else number(v)) for k, v in fields.items()}
+            result[kind] = {k: (v.currentData() if k == "direction" else values[f"{kind}.{k}"]) for k, v in fields.items()}
         result["metadata"] = {k: v.text().strip() for k, v in self.meta_fields.items()}
         return Settings.from_dict(result).payload()
 
@@ -543,12 +654,17 @@ class Window(W.QMainWindow):
                     field.setText("" if value is None else str(value))
         for key, field in self.meta_fields.items():
             field.setText(str(settings.get("metadata", {}).get(key, "")))
+        for edit in self.settings_edits().values():
+            edit.reviewed = False
+            edit.show_issue(None, self.language)
+        self.draft_notice.hide()
 
     def apply_settings(self):
         self.runtime.command("apply", settings=self.collect_settings())
+        self.feedback_notice.hide()
 
     def save_settings(self):
-        settings = self.collect_settings()
+        settings = self.collect_settings(complete=False)
         path, _ = W.QFileDialog.getSaveFileName(self, "Save settings", str(self.root/"data/profiles"/"Experiment.json"), "JSON (*.json)")
         if path:
             atomic_json(path, {"format": "em2-settings-1", "settings": settings})
@@ -564,9 +680,10 @@ class Window(W.QMainWindow):
             self.notice_text = "配置已加载到表单，点击应用后生效 / Preset loaded; click Apply to activate."
 
     def set_allowance(self, refill):
-        value = number(self.allowance)
-        if value is None:
-            raise ValueError("Enter the available volume of this load")
+        value, issue = self.validate_allowance()
+        if issue:
+            self.allowance.setFocus()
+            raise forms.FormError("Invalid allowance")
         self.runtime.command("allowance", value=value, refill=refill)
 
     def make_plot(self, title, ylabel):
@@ -663,7 +780,13 @@ class Window(W.QMainWindow):
 
     def enable_control(self):
         settings = self.runtime.snapshot["settings"]
-        Settings.from_dict(settings).validate(complete=True)
+        try:
+            Settings.from_dict(settings).validate(complete=True)
+        except ValueError:
+            self.navigation.setCurrentRow(2)
+            self.validate_settings_form(all_fields=True, complete=True)
+            self.feedback_notice.show()
+            raise forms.FormError("Apply complete settings before enabling feedback")
         sig = self.confirm_hardware({"purpose": "experiment", "settings": settings})
         if sig:
             self.runtime.command("enable", signature=sig)
@@ -688,8 +811,10 @@ class Window(W.QMainWindow):
         row = W.QHBoxLayout()
         self.range_start = line_number("Start min (optional)")
         self.range_end = line_number("End min (optional)")
-        row.addWidget(self.range_start)
-        row.addWidget(self.range_end)
+        row.addWidget(self.range_start.container)
+        row.addWidget(self.range_end.container)
+        for edit in (self.range_start, self.range_end):
+            self.watch_number(edit, self.history_range)
         row.addWidget(self.button("Export CSV / JSON", "Export CSV / JSON", lambda: self.export_history(False)))
         row.addWidget(self.button("Export packages", "Export packages", lambda: self.export_history(True)))
         row.addWidget(self.button("Export PNG / SVG", "Export PNG / SVG", lambda: self.export_plots(self.history_plots)))
@@ -734,15 +859,30 @@ class Window(W.QMainWindow):
         return paths
 
     def compare_history(self):
+        start, end = self.history_range(submit=True)
         paths = self.selected_history()
-        start, end = number(self.range_start) or 0., number(self.range_end)
-        if start < 0 or end is not None and end <= start:
-            raise ValueError("Invalid time range")
         field = self.history_field.currentText()
         absolute = self.align.currentIndex() == 1
         def read():
             return [(storage.summary(path), [storage.series(path, k, field, start*60, end*60 if end is not None else None) for k in ("ph", "ec")], storage.recent_events(path, 20)) for path in paths]
         self.submit(read, lambda data: self.draw_history(data, absolute))
+
+    def history_range(self, submit=False):
+        edits = {"start": self.range_start, "end": self.range_end}
+        values, errors = forms.parse_fields({k: e.text() for k, e in edits.items()})
+        for key in edits:
+            forms.positive(values, errors, key, zero=True)
+        start, end = values["start"] or 0., values["end"]
+        if not errors and end is not None and end <= start:
+            errors["end"] = ("结束时间必须大于开始时间。", "End time must be greater than start time.")
+        for key, edit in edits.items():
+            if submit:
+                edit.reviewed = True
+            edit.show_issue(errors.get(key) if edit.reviewed else None, "en")
+        if submit and errors:
+            edits[next(iter(errors))].setFocus()
+            raise forms.FormError("Invalid history time range")
+        return start, end
 
     def draw_history(self, data, absolute):
         for plot in self.history_plots:
@@ -905,7 +1045,7 @@ class Window(W.QMainWindow):
         h = s["hardware"]
         self.hardware_text.setPlainText((f"注射器容量：{fmt(h.get('capacity_ml'))} mL\n有效面积：{fmt(h.get('area_mm2'))} mm²\n仪器推力：{fmt(h.get('force_percent'),0)} %\n注射器型号与校准历史：仪器未提供，可在实验设置中添加备注。" if zh else
                                         f"Syringe capacity: {fmt(h.get('capacity_ml'))} mL\nEffective area: {fmt(h.get('area_mm2'))} mm²\nInstrument force: {fmt(h.get('force_percent'),0)} %\nSyringe model and calibration history are not provided. Add a note in Settings."))
-        if not self.test_force.text() and s["hardware"].get("force_percent"):
+        if not self.test_force.text() and not self.test_force.reviewed and not self.test_force.hasFocus() and s["hardware"].get("force_percent"):
             self.test_force.setText(str(s["hardware"]["force_percent"]))
         for kind in ("ph", "ec"):
             sample = s["samples"].get(kind, {})
@@ -938,6 +1078,9 @@ class Window(W.QMainWindow):
         self.effective_settings.setText(("当前有效 / Effective: " if zh else "Effective: ")+describe(s["settings"])+("\n"+("下一周期 / Next cycle: " if zh else "Next cycle: ")+describe(pending) if pending else ""))
         if s.get("pending_allowance") is not None:
             self.load_status.setText(self.load_status.text()+f" · Pending allowance: {s['pending_allowance']} mL")
+        if s["remaining"] is not None and s["settings"].get("dose_ml") is not None and s["remaining"]+1e-10 < s["settings"]["dose_ml"]:
+            self.load_status.setText(self.load_status.text()+(" · 余量不足完整一针；记录与有效设置保留。" if zh else
+                                                            " · Insufficient for a full dose; recording and settings are retained."))
         times = []
         for kind, sample in (("pH", ph), ("Conductivity", ec)):
             age = max(0, time.monotonic()-sample["mono"]) if "mono" in sample else None

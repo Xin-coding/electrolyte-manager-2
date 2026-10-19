@@ -86,7 +86,10 @@ def encode(value, minimum=94):
         raise ValueError("Pump parameter must be positive")
     candidates = []
     for u in range(minimum, 107):
-        n = round(value/10.**(u-103))
+        scaled = value/10.**(u-103)
+        if not math.isfinite(scaled):
+            continue
+        n = round(scaled)
         if 1 <= n <= 9999:
             candidates.append((abs(n*10.**(u-103)-value), u > 103, abs(u-103), n, u))
     if not candidates:
