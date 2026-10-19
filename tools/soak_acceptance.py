@@ -3,6 +3,7 @@ import argparse
 import json
 import sys
 import time
+import subprocess
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import psutil
@@ -34,6 +35,7 @@ for kind,port in (("ph","COM8"),("ec","COM3")):
 runtime.command("start_recording",name="Acceptance_24h_buffer_acquisition")
 process = psutil.Process()
 started = time.monotonic()
+source_commit = subprocess.check_output(["git","rev-parse","HEAD"],cwd=Path(__file__).resolve().parents[1],text=True).strip()
 peak = process.memory_info().rss
 last_check = started
 max_timer_delay = 0.
@@ -48,10 +50,11 @@ def report():
     snap = runtime.snapshot
     database = snap.get("path") or database
     data = {"status":"running", "requested_hours":args.hours, "elapsed_hours":(now-started)/3600,
+            "source_commit":source_commit,
             "pid":process.pid,"memory_MiB":process.memory_info().rss/1024**2,"peak_MiB":peak/1024**2,
             "max_timer_delay_s":max_timer_delay,"database":database,
             "connections":snap.get("connections",{}),"sample_counts":runtime.sequence,
-            "storage_error":snap.get("storage_error",""),"pump_connected":False}
+            "storage_error":snap.get("storage_error",""),"pump_connected":snap.get("connections",{}).get("pump",{}).get("connected",False)}
     with (root/"exports/endurance-metrics.jsonl").open("a",encoding="utf-8") as f:
         f.write(json.dumps(data)+"\n")
     if now-started>=args.hours*3600:

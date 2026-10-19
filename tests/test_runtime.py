@@ -1,7 +1,7 @@
 import time
 from dataclasses import asdict
 from em2.runtime import Runtime
-from em2.models import Sample, Dose, DoseResult
+from em2.models import Sample, Dose, DoseResult, Binding
 from em2.storage import summary, readonly
 
 
@@ -70,6 +70,23 @@ def test_start_intent_is_durable_before_authorization(tmp_path):
             assert db.execute("SELECT COUNT(*) FROM events WHERE kind='injection_intent'").fetchone()[0] == 1
         assert r.intent["dose"]["id"] == d.id
         r.engine.active = None
+    finally:
+        r.close()
+        r.thread.join(10)
+
+
+def test_refill_cancels_pending_allowance_from_previous_load(tmp_path):
+    r = Runtime(tmp_path)
+    try:
+        r.engine.connected["pump"] = True
+        r.pump_status = {"state":3,"error":0}
+        r.bindings["pump"] = Binding("pump","unused","test-pump")
+        r.engine.ready_at = time.monotonic()+20
+        r.command("allowance",value=10.)
+        wait(lambda:r.snapshot.get("pending_allowance")==10.)
+        r.command("allowance",value=20.,refill=True)
+        wait(lambda:r.snapshot.get("load",{}).get("limit_ml")==20.)
+        assert r.snapshot["pending_allowance"] is None
     finally:
         r.close()
         r.thread.join(10)

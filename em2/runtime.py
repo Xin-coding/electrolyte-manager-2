@@ -310,8 +310,10 @@ class Runtime:
                 self.event("allowance_requested", {"old": e.load.limit_ml, "new": data["value"]})
                 return
             e.set_allowance(data["value"], data.get("refill", False), self.bindings["pump"].identity)
+            self.pending_allowance = None
             if data.get("refill"):
                 self.intent = None
+                self.pending_reason = ""
                 self.persist_ledger()
         elif name == "test":
             if data.pop("signature", None) != self.hardware.get("signature"):
