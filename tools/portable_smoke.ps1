@@ -11,7 +11,9 @@ try {
     $env:EM2_HOME = $testRoot
     $env:PYTHONPATH = ''
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-    $process = Start-Process -FilePath $exePath -WorkingDirectory $testRoot -WindowStyle Hidden -PassThru
+    # This is an interactive GUI acceptance check, not a background service.
+    $process = Start-Process -FilePath $exePath -WorkingDirectory $testRoot -WindowStyle Normal -PassThru
+    $null = $process.Handle
     $deadline = (Get-Date).AddSeconds(45)
     do {
         Start-Sleep -Milliseconds 300
