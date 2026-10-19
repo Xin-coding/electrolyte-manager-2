@@ -1,5 +1,6 @@
 """Package only executable dependencies and public documentation, never local data."""
 from datetime import datetime, timezone
+import argparse
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -11,6 +12,9 @@ import urllib.request
 import zipfile
 
 source = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source-ref', default='HEAD', help='Git ref of the packaged application code')
+args = parser.parse_args()
 root = source.parent
 app = root/"app"
 licenses = root/"licenses"
@@ -33,9 +37,11 @@ for name,url in (("LGPL-3.0.txt","https://www.gnu.org/licenses/lgpl-3.0.txt"),
             target.write_bytes(response.read())
 
 archive = root/"ElectrolyteManager-2.0.0-Windows-x64.zip"
-commit = subprocess.check_output(["git","rev-parse","HEAD"],cwd=source,text=True).strip()
+commit = subprocess.check_output(["git","rev-parse",args.source_ref+'^{commit}'],cwd=source,text=True).strip()
+documentation_commit = subprocess.check_output(["git","rev-parse","HEAD"],cwd=source,text=True).strip()
 manifest = {"version":"2.0.0","source_commit":commit,"built_utc":datetime.now(timezone.utc).isoformat(),
-            "validation":"Pre-release; 24 h endurance and external gravimetric validation not yet complete",
+            "release_channel":"stable", "documentation_commit":documentation_commit,
+            "validation":"24 h endurance not completed: run ended after approximately 1 h 12 min; external gravimetric and physical fault-injection validation remain incomplete",
             "dependencies":{n:metadata.version(n) for n in ("PySide6","pyqtgraph","pyserial","numpy")}}
 (root/"release.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
 with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED,compresslevel=6) as z:

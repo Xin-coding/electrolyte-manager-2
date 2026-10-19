@@ -2,6 +2,8 @@
 
 This document distinguishes executable software checks, instrument evidence and checks that require more elapsed time or external measurement.
 
+Version 2.0.0 was approved for general release on 2026-10-19. Release status does not change the validation results below.
+
 ## Completed
 
 - 51 automated tests: directional pH/EC target bands, raw alarm counts and recovery, new-sample deduplication, full monotonic mixing, sensor outages, settings revisions, allowance/refill/test accounting, unique results, delayed counters, preparation longer than six seconds, missed short running states, repeated flow configuration, START reply loss, STOP during preparation, bounded storage, failed writes/recovery, crash marking, package export/import, language switching, history display and PNG export.
@@ -14,9 +16,9 @@ This document distinguishes executable software checks, instrument evidence and 
 - Two real feedback-sequence 0.100 mL pulses with a 10 s full mixing interval: next decision occurred 11.843 s after confirmed stop; the next physical START occurred 15.359 s after stop (including parameter preparation). Both counter deltas were 0.100 mL.
 - A 230.9 s real acquisition segment collected 115 pH points and four conductivity records. The three live conductivity records arrived 60.000 s and 60.016 s apart, with no reconnection events during that segment.
 
-## In progress / not yet claimed
+## Not completed / not claimed
 
-- At least 24 continuous hours of real acquisition with the actual Qt interface: `tools/soak_acceptance.py` writes `exports/endurance-status.json`. Until it reports completion and is reviewed, the 24 h acceptance is **pending**.
+- The continuous acquisition run ended after approximately 1 h 12 min, preserving 2,144 pH samples and 71 conductivity records. Follow-up monitoring was disabled at the user's request. The 24 h acceptance is **not completed**; the partial run is not counted as a 24 h pass.
 - External gravimetric measurement of actual liquid volume/flow has not been performed. Counter and command timing evidence is not a substitute for a balance and known-density fluid.
 - Physical unplug/replug during active injection, real force-limit activation, disk-full on the real Windows volume and deliberate host power loss are not claimed as physical tests. Relevant failure paths have offline coverage, but hardware fault-injection acceptance remains to be completed.
 - The sensors are immersed in separate buffers; no electrolysis was running. No claim is made that chemical feedback performance has been validated.
