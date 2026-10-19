@@ -41,6 +41,27 @@ CREATE INDEX IF NOT EXISTS events_kind_t ON events(kind,t);
 """
 
 
+def write_injection(db, data):
+    d, r = data["dose"], data["result"]
+    # Retries after a lost commit acknowledgement must not count twice.
+    existing = db.execute("SELECT payload FROM injections WHERE id=?", (d["id"],)).fetchone()
+    if existing:
+        if json.loads(existing[0]) != data:
+            raise ValueError("Conflicting saved result for injection "+d["id"])
+        return
+    db.execute("INSERT INTO injections VALUES (?,?,?,?,?,?,?,?,?,?)", (d["id"], data["t"], d["purpose"], d["volume_ml"], r["amount_ml"], data["cumulative_ml"], data["load"]["used_ml"], r["source"], int(r["stopped"]), compact(data)))
+
+
+def recover_injection(path, data):
+    """Complete a locally journaled result after a process exit; no device I/O."""
+    with closing(sqlite3.connect(Path(path).resolve().as_uri()+"?mode=rw", uri=True, timeout=.5)) as db, db:
+        row = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
+        if not row or json.loads(row[0]) != FORMAT:
+            raise ValueError("Invalid pending-result experiment file")
+        db.execute("PRAGMA synchronous=FULL")
+        write_injection(db, data)
+
+
 def compact(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
@@ -148,8 +169,7 @@ class Store:
         elif kind == "settings":
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?,?)", (data[0], data[1], compact(data[2])))
         elif kind == "injection":
-            d, r = data["dose"], data["result"]
-            db.execute("INSERT OR IGNORE INTO injections VALUES (?,?,?,?,?,?,?,?,?,?)", (d["id"], data["t"], d["purpose"], d["volume_ml"], r["amount_ml"], data["cumulative_ml"], data["load"]["used_ml"], r["source"], int(r["stopped"]), compact(data)))
+            write_injection(db, data)
 
     def _run(self):
         db = sqlite3.connect(self.path, timeout=.5)

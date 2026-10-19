@@ -127,6 +127,7 @@ class Load:
     used_ml: float = 0.0
     identity: str = ""
     uncertain: bool = False
+    estimated: bool = False
 
     @property
     def remaining(self):
@@ -184,3 +185,4 @@ class DoseResult:
     recovered: bool = False
     evidence: dict = field(default_factory=dict)
     error_kind: str = ""
+    warnings: list[str] = field(default_factory=list)

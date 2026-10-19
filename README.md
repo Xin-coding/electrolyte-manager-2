@@ -1,6 +1,6 @@
 # Electrolyte Manager 2.0
 
-Current version: **2.0.2**. Numeric drafts now show red field borders and specific inline reasons. Invalid submissions never replace effective or pending settings or alter a running dose/mixing wait. See [input protection and validation](docs/CHANGES_2_0_2.md); the [2.0.1 pump fixes](docs/CHANGES_2_0_1.md) remain included.
+Current version: **2.0.3**. STOP cancels queued injections, delayed START and transient connection failures are reconciled, and final results are journaled before allowance updates. Flow, timing and counter deviations are monitoring notes rather than stop/pause conditions. See [pump boundaries and control policy](docs/CHANGES_2_0_3.md). The [2.0.2 input protection](docs/CHANGES_2_0_2.md) remains included.
 
 Independent Windows acquisition and syringe-pump feedback software for Metrohm 781, Apera PC8500 and Longer ASP. This is a fresh Python / PySide6 application; the previous application is not its code baseline. Hardware protocols and observed firmware behavior were used as references.
 
@@ -19,7 +19,9 @@ The first release provides five pages: Connections, Pump tests, Settings, Monito
 
 ## Control behavior
 
-A new control sample can cause at most one finite injection. The software confirms STOP, waits the full configured mixing time on a monotonic clock, then requires a genuinely new post-mixing sample. Target-band arrival during a pulse does not abort it. Alarm, manual STOP and actual faults can interrupt it. Remaining load must support a complete pulse.
+A new control sample can cause at most one finite injection. The software confirms the stopped state, waits the full configured mixing time on a monotonic clock, then requires a genuinely new post-mixing sample. Target-band arrival during a pulse does not abort it. Alarm, manual STOP and actual faults can interrupt it. Remaining load must support a complete pulse.
+
+Reported flow, dose deviation, counter resets/jumps/instability and elapsed time beyond the requested-time estimate do not themselves send STOP or latch a feedback pause. Ordinary dosing uses the verified finite pump limit, with software supervision of confirmed volume-limit readings. An explicit software STOP test is a separate user-requested interruption. If final counters are unusable, the programmed finite cap is charged once as an explicitly labeled estimate; the current load displays an approximation mark. No extra needle makes up a reported short delivery. Test results cannot shorten an experiment's mixing interval.
 
 pH and conductivity use the same directional target-band logic. EMA smoothing uses alpha 0.5. Alarms use raw valid data: pH needs three consecutive out-of-range readings and three in-range readings to recover; conductivity needs one each. Only the selected sensor interlocks dosing. Sensor loss does not end recording. A finite active pulse finishes, then dosing waits for reconnection/new data.
 
@@ -29,11 +31,11 @@ The red STOP button requests a priority serial STOP. It is **a software control*
 
 ## Records and plots
 
-Each experiment has its own SQLite database with original/processed samples, instrument and reception times, settings revisions, decisions, alarms, connection events, injection intents/results and refill events. WAL and short background transactions keep acquisition separate from presentation. Intent is persisted before START. Stable pump counters take precedence in final accounting; estimated and uncertain values retain their provenance.
+Each experiment has its own SQLite database with original/processed samples, instrument and reception times, settings revisions, decisions, alarms, connection events, injection intents/results and refill events. WAL and short background transactions keep acquisition separate from presentation. Intent is persisted before START. Final evidence is locally journaled, then committed to SQLite before clearing the intent and updating the allowance. Retries and startup journal recovery cannot account for a result twice or resume old feedback. Stable plausible pump counters take precedence; estimated values retain their provenance and warnings.
 
 Use Data manager to compare up to 12 EM2 experiments, aligned by elapsed or absolute time. Export sample/injection CSV, settings JSON, streaming event JSONL, PNG/SVG plots or an `.em2zip` experiment package. Older application databases are deliberately unsupported.
 
-Plots retain at most 5,000 representative points per curve; original records are never discarded to meet the plot limit. Raw diagnostics are off by default and rotate within 200 MiB. Persistent storage failure for 30 seconds requests STOP and pauses feedback; recovery needs a manual resume.
+Plots retain at most 5,000 representative points per curve; original records are never discarded to meet the plot limit. Raw diagnostics are off by default and rotate within 200 MiB. Persistent storage failure for 30 seconds blocks subsequent injections while the already-started finite dose completes; signal alarms and user STOP remain active. A final-result commit failure retains the result journal and prevents the next injection until saved; feedback needs a manual resume after storage recovery.
 
 ## Estimated hydroxide
 

@@ -179,7 +179,8 @@ def test_valid_effective_resume_ignores_invalid_unapplied_draft(ui, monkeypatch)
     monkeypatch.setattr(w, "confirm_hardware", lambda details: seen.append(details) or "known")
     w.enable_control()
     assert seen[0]["settings"]["dose_ml"] == .1
-    assert r.commands.get_nowait() == ("enable", {"signature": "known"})
+    action, data = r.commands.get_nowait()
+    assert action == "enable" and data["signature"] == "known"
 
 
 def test_stop_cap_and_capacity_are_inline_finite_test_is_independent(ui):

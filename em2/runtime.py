@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import asdict
 import copy
 import logging
+from pathlib import Path
 import queue
 import threading
 import time
@@ -12,7 +13,7 @@ import time
 from .engine import Engine
 from .models import Binding, Dose, DoseResult, Load, Sample, Settings, finite, utc_now
 from .paths import atomic_json, diagnostic_logger, keep_awake, read_json, root_dir
-from .storage import Store, mark_interrupted
+from .storage import Store, mark_interrupted, recover_injection
 from .devices.sensors import SensorWorker, ports, identify
 from .devices.pump import PumpWorker
 from .errors import ParameterError
@@ -26,6 +27,9 @@ class Runtime:
         self.commands = queue.Queue(maxsize=100)
         self.incoming = queue.Queue(maxsize=5000)
         self.quit = threading.Event()
+        self.stop_lock = threading.Lock()
+        self.stop_generation = 0
+        self.priority_stop = ""
         self.workers = {}
         self.bindings = {}
         self.connections = {}
@@ -59,6 +63,10 @@ class Runtime:
             load.uncertain = True
         self.engine = Engine(settings, load, self.event)
         self.intent = ledger.get("intent")
+        self.result_pending = ledger.get("pending_result")
+        self.result_retry_at = 0.
+        if self.result_pending:
+            load.uncertain = True
         self.scan_busy = False
         self.finish_pending = False
         self.pending_reason = ""
@@ -71,14 +79,25 @@ class Runtime:
         self.thread.start()
 
     def command(self, action, **data):
+        if action in {"test", "enable"}:
+            with self.stop_lock:
+                data["_stop_generation"] = self.stop_generation
         self.commands.put_nowait((action, data))
 
     def stop(self, reason="emergency_stop"):
         # Direct priority flag bypasses storage, GUI refresh and the service queue.
+        with self.stop_lock:
+            self.stop_generation += 1
+            self.priority_stop = reason
         worker = self.workers.get("pump")
         if worker:
             worker.stop(reason)
-        self.command("pause", reason=reason)
+
+    def apply_priority_stop(self):
+        with self.stop_lock:
+            reason, self.priority_stop = self.priority_stop, ""
+        if reason:
+            self.engine.pause(reason)
 
     def emit(self, name, data):
         try:
@@ -108,25 +127,77 @@ class Runtime:
             if self.store:
                 self.store.put("settings", (data["new"]["version"], now, data["new"]))
             atomic_json(self.config_file, data["new"])
-        if name == "dose_accounted":
-            self.intent = None
-            try:
-                self.persist_ledger()
-            except OSError:
-                self.engine.pause("storage_paused")
-            destination = self.store if data["dose"]["purpose"] == "experiment" else self.bench
-            if destination:
-                destination.put("injection", {**data, "t": now if destination == self.store else time.monotonic()-self.bench_epoch}, critical=True)
         if name in {"allowance_changed", "refill"}:
             self.persist_ledger()
 
     def persist_ledger(self):
         try:
-            atomic_json(self.ledger_file, {"load": asdict(self.engine.load), "intent": self.intent})
+            atomic_json(self.ledger_file, {"load": asdict(self.engine.load), "intent": self.intent,
+                                           "pending_result": self.result_pending})
             self.local_storage_error = ""
         except OSError as exc:
             self.local_storage_error = "Local dose ledger: "+str(exc)
             raise
+
+    def finish_result(self, dose, result):
+        if self.result_pending:
+            # The first final result is immutable; duplicate delivery is harmless.
+            if self.result_pending["data"]["dose"]["id"] != dose.id:
+                raise RuntimeError("Another injection result is still awaiting storage")
+        else:
+            destination = self.store if dose.purpose == "experiment" else self.bench
+            if not destination and not result.started and not self.intent:
+                return self.engine.complete(result)
+            if not destination:
+                raise RuntimeError("Injection result has no experiment data store")
+            load = asdict(self.engine.load)
+            load.update(used_ml=load["used_ml"]+max(0., result.amount_ml), uncertain=False)
+            load["estimated"] = load.get("estimated", False) or "estimate" in result.source
+            data = {"dose": asdict(dose), "result": asdict(result), "load": load,
+                    "cumulative_ml": self.engine.cumulative_ml+(max(0., result.amount_ml) if dose.purpose == "experiment" else 0.),
+                    "t": self.elapsed() if destination == self.store else time.monotonic()-self.bench_epoch}
+            self.result_pending = {"path": str(destination.path), "data": data}
+        return self.retry_result()
+
+    def retry_result(self):
+        pending = self.result_pending
+        if not pending:
+            return True
+        self.result_retry_at = time.monotonic()+1
+        try:
+            # Journal verified evidence before changing either the volume ledger
+            # or active command. A crash can replay this one immutable result.
+            self.persist_ledger()
+            path = Path(pending["path"]).resolve()
+            path.relative_to((self.root/"data").resolve())
+            data = pending["data"]
+            destination = next((s for s in (self.store, self.bench) if s and s.path.resolve() == path), None)
+            if destination:
+                if not destination.put("injection", data, critical=True):
+                    raise OSError("Final injection result commit was not confirmed")
+            else:
+                recover_injection(path, data)
+            # Commit the new allowance and clear the intent in one atomic file
+            # replacement, only after the SQLite transaction has committed.
+            atomic_json(self.ledger_file, {"load": data["load"], "intent": None, "pending_result": None})
+        except Exception as exc:
+            self.local_storage_error = "Final injection result: "+str(exc)
+            self.pending_reason = self.local_storage_error
+            self.phase = "saving_result"
+            if self.engine.manual_reason != "storage_paused":
+                self.engine.pause("storage_paused", interrupt=False)
+            return False
+        self.intent = self.result_pending = None
+        self.local_storage_error = self.pending_reason = ""
+        result = DoseResult(**data["result"])
+        if self.engine.active and self.engine.active.id == result.id:
+            self.engine.complete(result)
+        else:
+            # Startup recovery restores accounting only, never old feedback.
+            self.engine.load = Load(**data["load"])
+        self.phase, self.progress = "idle", {}
+        self.engine.hardware_ready = self.engine.connected["pump"] and self.pump_status.get("state") == 3 and not self.pump_status.get("error")
+        return True
 
     def authorize(self, dose, evidence):
         ack = threading.Event()
@@ -138,7 +209,7 @@ class Runtime:
         try:
             d = request["dose"]
             e = self.engine
-            if not e.active or e.active.id != d.id or e.stop_requested or e.storage_failed:
+            if not e.active or e.active.id != d.id or e.stop_requested or e.storage_failed or self.priority_stop or self.result_pending:
                 return
             if d.purpose == "experiment" and (not e.enabled or e.alarm or not e.connected[e.settings.control]):
                 return
@@ -246,7 +317,7 @@ class Runtime:
             self.hardware = data
             if old and old != data["signature"]:
                 self.confirmed_signature = None
-                e.pause("hardware_changed")
+                e.pause("hardware_changed", interrupt=False)
                 self.event("hardware_changed", data)
         elif name == "pump_phase":
             self.phase = data["phase"]
@@ -257,6 +328,10 @@ class Runtime:
                 self.store.event(self.elapsed(), name, data)
         elif name in {"dose_result", "dose_pending"}:
             result = DoseResult(**data)
+            if result.error_kind == "accounting_error" and result.stopped and result.amount_ml is not None:
+                result.warnings.append(result.error)
+                result.error = result.error_kind = ""
+                data = asdict(result)
             dose = e.active
             if dose and dose.id == result.id:
                 entry = {"time": utc_now(), "dose": asdict(dose), "result": data}
@@ -265,11 +340,15 @@ class Runtime:
                     self.last_failure = entry
                 elif name == "dose_result":
                     self.last_failure = None
-            e.complete(result)
+            completed = False
+            if name == "dose_result" and dose and dose.id == result.id and result.stopped and result.amount_ml is not None:
+                completed = self.finish_result(dose, result)
+            elif name == "dose_pending":
+                e.complete(result)
             if name == "dose_pending":
                 self.pending_reason = result.error or "Final dose is unknown; verify the delivered amount"
                 self.event(name, data)
-            else:
+            elif completed:
                 self.pending_reason = ""
                 self.phase = "idle"
                 self.progress = {}
@@ -279,6 +358,13 @@ class Runtime:
 
     def dispatch(self, name, data):
         e = self.engine
+        if name in {"test", "enable"}:
+            generation = data.pop("_stop_generation", self.stop_generation)
+            if generation != self.stop_generation or self.priority_stop:
+                self.event("command_cancelled", {"command": name, "reason": "superseded_by_stop"})
+                return
+        if self.result_pending and name in {"test", "enable", "allowance", "start_recording"}:
+            raise ValueError("Wait for the final injection result to be saved")
         if name == "scan":
             self.scan()
         elif name == "connect":
@@ -389,6 +475,7 @@ class Runtime:
             mark_interrupted(self.root/"data")
             while not self.quit.is_set():
                 try:
+                    self.apply_priority_stop()
                     for _ in range(min(100, self.incoming.qsize())):
                         name, data = self.incoming.get_nowait()
                         self.handle(name, data)
@@ -396,10 +483,13 @@ class Runtime:
                         name, data = self.commands.get_nowait()
                         self.dispatch(name, data)
                     e = self.engine
+                    self.apply_priority_stop()
+                    if self.result_pending and time.monotonic() >= self.result_retry_at:
+                        self.retry_result()
                     stores = [s for s in (self.store, self.bench) if s]
                     e.storage_failed = bool(self.local_storage_error) or any(s.failure_age >= 30 for s in stores)
-                    if e.storage_failed and (e.enabled or e.active):
-                        self.stop("storage_paused")
+                    if e.storage_failed and (e.enabled or e.active and e.manual_reason != "storage_paused"):
+                        e.pause("storage_paused", interrupt=False)
                     if e.stop_requested:
                         worker = self.workers.get("pump")
                         if worker:

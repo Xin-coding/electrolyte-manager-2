@@ -1,6 +1,8 @@
-# Validation status — 2.0.2
+# Validation status — 2.0.3
 
 This document distinguishes executable software checks, instrument evidence and checks that require more elapsed time or external measurement.
+
+Version 2.0.3 has **158 passing automated tests**, including the revised monitoring-only policy for flow, duration and counter deviations; STOP priority and stale-queue invalidation; delayed START and pre-START connection failure; result-journal replay and exactly-once accounting; and test/formal mixing isolation. Storage failure now prevents the next injection without interrupting an already-started finite dose. Existing signal-alarm protection remains active during that wait. These boundary checks use memory transports and explicitly prohibit real serial ports. No new physical injection or fault-injection validation is claimed. See [2.0.3 changes](CHANGES_2_0_3.md).
 
 Version 2.0.2 adds 43 input-protection regressions, bringing the suite to 126 passing tests. Tests prohibit physical serial access and verify malformed/range/precision errors, bilingual inline messages, cross-field alarm and STOP limits, partial presets, and unchanged effective/pending settings, consumption and full mixing deadline after rejected drafts. Existing pump packet and feedback tests remain included. No additional physical injections were required for this form change; the 2.0.1 bench evidence remains historical evidence, not a new hardware test. See [2.0.2 changes](CHANGES_2_0_2.md).
 

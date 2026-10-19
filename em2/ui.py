@@ -54,6 +54,8 @@ QToolTip { background: #18324a; color: white; padding: 6px; border: none; }
 STATE_ZH = {
     "idle": "就绪", "recording": "正在记录", "preparing": "准备泵参数",
     "injecting": "正在注射", "confirming_stop": "确认停止与最终计量", "mixing": "等待充分混合",
+    "awaiting_counter": "已停泵，等待最终计数", "accounting_review": "已停泵，最终计量需核实",
+    "saving_result": "已停泵，等待注射结果保存",
     "waiting_pump": "等待泵连接或状态核实", "waiting_signal": "等待控制信号重连",
     "waiting_target": "等待初始信号稳定", "waiting_new_sample": "等待混合后的新读数",
     "target_outside_alarm": "目标容差区不在报警范围内", "monitoring": "目标容差内，继续监测",
@@ -159,6 +161,10 @@ def dose_result_text(entry, zh):
         text += f" · STOP test passed: {result['evidence'].get('stop_test_passed', False)}"
     if result.get("error"):
         text += f"\n{category}: {result['error']}"
+    if result.get("warnings"):
+        text += "\n"+("监测提示（不暂停反馈）：" if zh else "Monitoring notes (feedback continues): ")+"; ".join(result["warnings"])
+    if "estimate" in result.get("source", ""):
+        text += "\n"+("记账量为估算，非实测；计数不可信时按本针设定的泵端限量计入额度。" if zh else "Accounted volume is an estimate, not a measurement; an unusable counter is charged at the programmed finite cap.")
     return text
 
 
@@ -1062,8 +1068,13 @@ class Window(W.QMainWindow):
         if s["load"]["uncertain"]:
             self.cards["used"].setText("? "+fmt(s["load"]["used_ml"]))
             self.cards["remaining"].setText("?")
+        elif s["load"].get("estimated"):
+            self.cards["used"].setText("≈ "+fmt(s["load"]["used_ml"]))
+            self.cards["remaining"].setText("≈ "+fmt(s["remaining"]))
         self.load_status.setText((f"有效额度：{fmt(s['load']['limit_ml'])} mL  ·  已用：{fmt(s['load']['used_ml'])} mL  ·  剩余：{fmt(s['remaining'])} mL" if zh else
                                  f"Effective allowance: {fmt(s['load']['limit_ml'])} mL   ·   Delivered: {fmt(s['load']['used_ml'])} mL   ·   Remaining: {fmt(s['remaining'])} mL"))
+        if s["load"].get("estimated"):
+            self.load_status.setText(self.load_status.text()+(" · 含估算量，详见注射记录" if zh else " · Includes estimates; see injection records"))
         pending = s.get("pending")
         self.settings_status.setText((f"当前有效 v{s['settings']['version']}"+(f" → 待生效 v{pending['version']} · 本针及完整混合结束后生效" if pending else " · 无待生效修改")) if zh else
                                     f"Effective v{s['settings']['version']}"+(f"  → Pending v{pending['version']} · applies after the current dose and full mixing wait" if pending else "  · No pending change"))

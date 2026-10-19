@@ -77,14 +77,14 @@ class RegisterPump(PumpTransport):
     def __init__(self):
         self.calls = []
         self.regs = {}
-    def hardware(self):
+    def hardware(self, emergency=False):
         return {"signature": "same", "capacity_ml": 60, "force_percent": 50}
     def checked(self, reg, value):
         self.calls.append((reg, value))
     def pair(self, reg, value):
         self.calls.append((reg, value))
         self.regs[reg] = value
-    def read(self, reg, count):
+    def read(self, reg, count, emergency=False):
         r = [0]*15
         r[:2], r[2:4], r[13:15] = self.regs[0x68], self.regs[0x6a], [6, 100]
         return r

@@ -32,7 +32,7 @@ def test_record_without_devices_then_export_close(tmp_path):
         r.thread.join(10)
 
 
-def test_persistent_storage_failure_stops_without_ending_record(tmp_path):
+def test_persistent_storage_failure_blocks_next_dose_without_stopping_active_pump(tmp_path):
     r = Runtime(tmp_path)
     class Pump:
         def __init__(self): self.stopped=[]
@@ -45,11 +45,13 @@ def test_persistent_storage_failure_stops_without_ending_record(tmp_path):
         wait(lambda:r.snapshot.get("recording"))
         r.workers["pump"] = pump
         r.engine.enabled = True
+        r.engine.active = Dose(.1,1,50)
         r.store.failure_since = time.monotonic()-31
-        wait(lambda:bool(pump.stopped))
-        wait(lambda:not r.snapshot["enabled"])
+        wait(lambda:r.snapshot.get("state") == "injecting" and r.engine.manual_reason == "storage_paused")
         assert r.snapshot["recording"]
-        assert "storage_paused" in pump.stopped
+        assert not pump.stopped
+        assert r.engine.manual_reason == "storage_paused"
+        assert not r.engine.stop_requested
     finally:
         r.close()
         r.thread.join(10)

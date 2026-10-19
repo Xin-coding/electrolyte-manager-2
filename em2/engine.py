@@ -20,6 +20,7 @@ class Engine:
         self.hardware_ready = False
         self.active: Dose | None = None
         self.ready_at = 0.
+        self.test_ready_at = 0.
         self.cumulative_ml = 0.
         self.latest = {}
         self.filtered = {}
@@ -85,7 +86,7 @@ class Engine:
             if len(q) == q.maxlen and max(q)-min(q) <= tolerance+1e-12:
                 self.auto_target[sample.kind] = mean(q)
                 self.emit("initial_target", {"signal": sample.kind, "value": mean(q)})
-        if self.enabled and sample.kind == self.settings.control:
+        if (self.enabled or self.active and self.active.purpose == "experiment") and sample.kind == self.settings.control:
             cfg = getattr(self.settings, sample.kind)
             outside = x < cfg.lower or x > cfg.upper
             self.bad_count = min(5, self.bad_count+1) if outside else 0
@@ -119,10 +120,10 @@ class Engine:
         self._reset_signal()
         self.emit("feedback_enabled", {"version": self.settings.version})
 
-    def pause(self, reason="manual_pause"):
+    def pause(self, reason="manual_pause", interrupt=True):
         self.enabled = False
         self.manual_reason = reason
-        self.stop_requested = self.active is not None
+        self.stop_requested = self.stop_requested or (interrupt and self.active is not None)
         self.emit("feedback_paused", {"reason": reason})
 
     def apply(self, settings: Settings, now):
@@ -232,14 +233,17 @@ class Engine:
         dose = self.active
         self.load.used_ml += max(0., result.amount_ml)
         self.load.uncertain = False
+        self.load.estimated |= "estimate" in result.source
         if dose.purpose == "experiment":
             self.cumulative_ml += max(0., result.amount_ml)
-        self.ready_at = result.stopped_at + (dose.mix_s if result.started else 0.)
+            self.ready_at = max(self.ready_at, result.stopped_at + (dose.mix_s if result.started else 0.))
+        else:
+            self.test_ready_at = result.stopped_at + (dose.mix_s if result.started else 0.)
         self.active = None
         self.stop_requested = False
         self.emit("dose_accounted", {"dose": asdict(dose), "result": asdict(result),
                                     "load": asdict(self.load), "cumulative_ml": self.cumulative_ml})
-        if result.error:
+        if result.error and result.error_kind != "accounting_error":
             self.pause(result.error_kind or "pump_fault")
         return True
 

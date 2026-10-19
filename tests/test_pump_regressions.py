@@ -172,7 +172,7 @@ def test_one_tick_changes_restart_counter_stability(monkeypatch, stop_after):
         assert reads[-1]["counter_ml"] == reads[-2]["counter_ml"]
 
 
-@pytest.mark.parametrize("kind", ["parameter_error","configuration_error","communication_error","software_error","pump_fault","accounting_error"])
+@pytest.mark.parametrize("kind", ["parameter_error","configuration_error","communication_error","software_error","pump_fault"])
 def test_failed_results_keep_specific_reason_and_formal_label(tmp_path, kind):
     app = W.QApplication.instance() or W.QApplication([])
     r = Runtime(tmp_path); w = Window(r)
