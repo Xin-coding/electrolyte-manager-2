@@ -199,13 +199,27 @@ class Engine:
         return self.active
 
     def test(self, dose):
-        if self.active or self.enabled:
-            raise ValueError("Pump is reserved by feedback or another test")
         if dose.purpose not in {"test", "stop_test"}:
             raise ValueError("Invalid test purpose")
-        if self.load.uncertain or self.load.limit_ml is not None and not self.load.allows(dose.cap):
-            raise ValueError("Insufficient or unverified load allowance")
+        reason = self.test_block_reason(dose.cap)
+        if reason:
+            raise ValueError(reason)
         self.active = dose
+
+    def test_block_reason(self, cap=None):
+        if self.active:
+            return "pump_busy"
+        if self.enabled:
+            return "feedback_reserved"
+        if not self.connected["pump"]:
+            return "pump_disconnected"
+        if self.load.uncertain:
+            return "accounting_error"
+        if not self.hardware_ready:
+            return "waiting_pump"
+        if self.load.limit_ml is not None and (self.load.remaining <= 0 or cap is not None and not self.load.allows(cap)):
+            return "allowance_exhausted"
+        return ""
 
     def complete(self, result: DoseResult):
         if not self.active or result.id != self.active.id:
@@ -226,7 +240,7 @@ class Engine:
         self.emit("dose_accounted", {"dose": asdict(dose), "result": asdict(result),
                                     "load": asdict(self.load), "cumulative_ml": self.cumulative_ml})
         if result.error:
-            self.pause("pump_fault")
+            self.pause(result.error_kind or "pump_fault")
         return True
 
     def set_allowance(self, value, refill=False, identity=""):

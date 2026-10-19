@@ -12,6 +12,8 @@ import time
 import serial
 
 from ..models import Dose, DoseResult
+from ..parameters import pump_parameters
+from ..errors import ParameterError, ConfigurationError, ProtectionError, AccountingError, CommunicationError, failure_kind
 from .wire import TIME_UNITS, duration, encode, flow, packet, response, volume
 
 
@@ -56,27 +58,27 @@ class PumpTransport:
     def read(self, register, count, emergency=False):
         answer = self.exchange(3, register, count, 5+2*count, emergency)
         if len(answer) != count:
-            raise ValueError("Pump register count mismatch")
+            raise CommunicationError("Pump register count mismatch")
         return answer
 
     def write(self, register, value, emergency=False):
         if self.exchange(6, register, value, 8, emergency) != (register, value):
-            raise ValueError("Pump write acknowledgement mismatch")
+            raise CommunicationError("Pump write acknowledgement mismatch")
 
     def checked(self, register, value):
         self.write(register, value)
         if self.read(register, 1) != [value]:
-            raise ValueError("Pump parameter readback mismatch")
+            raise ConfigurationError("Pump parameter readback mismatch")
 
     def pair(self, register, pair):
         if self.exchange(16, register, pair, 8) != (register, 2):
-            raise ValueError("Pump pair acknowledgement mismatch")
+            raise CommunicationError("Pump pair acknowledgement mismatch")
         actual = self.read(register, 2)
         decode = flow if register == 0x6a else volume
         expected, got = decode(pair), decode(actual)
         tolerance = min(decode((1, actual[1])), expected*.001) if register == 0x6a else 1e-10
         if abs(expected-got) > tolerance+1e-10:
-            raise ValueError("Pump parameter readback mismatch")
+            raise ConfigurationError("Pump parameter readback mismatch")
 
     def status(self, emergency=False):
         r = self.read(0x100, 6, emergency)
@@ -99,30 +101,28 @@ class PumpTransport:
                 "model_name": None, "calibration_history": None}
 
     def configure_dose(self, dose, expected_signature):
+        encoded = pump_parameters(dose.cap, dose.flow_ml_min, dose.force_percent, dose.mix_s)
         hardware = self.hardware()
         if hardware["signature"] != expected_signature:
-            raise ValueError("Syringe configuration changed; review hardware information")
+            raise ConfigurationError("Syringe configuration changed; review hardware information")
         if dose.cap > hardware["capacity_ml"]+1e-10:
-            raise ValueError("Dose exceeds syringe capacity")
-        self.checked(0x6e, dose.force_percent)
+            raise ParameterError("Dose exceeds syringe capacity")
+        self.checked(0x6e, encoded["force"])
         self.checked(0x60, 1)
         self.checked(0x74, 1)
-        v = encode(dose.cap, 92)
-        if volume(v) > dose.cap+1e-10:
-            raise ValueError("Pump cannot represent the volume without rounding upward")
-        self.pair(0x68, v)
-        self.pair(0x6a, encode(dose.flow_ml_min/2))
-        self.pair(0x6a, encode(dose.flow_ml_min))
+        self.pair(0x68, encoded["volume"])
+        self.pair(0x6a, encoded["refresh_flow"])
+        self.pair(0x6a, encoded["flow"])
         r = self.read(0x68, 15)
         target, speed, seconds = volume(r[:2]), flow(r[2:4]), duration(r[13:15])
         expected_s = dose.cap/dose.flow_ml_min*60
         time_tolerance = min(TIME_UNITS[r[14]], max(.1, .1*expected_s))+1e-7
         speed_tolerance = min(flow((1, r[3])), dose.flow_ml_min*.001)+1e-10
         if abs(target-dose.cap) > 1e-10 or abs(speed-dose.flow_ml_min) > speed_tolerance or abs(seconds-expected_s) > time_tolerance:
-            raise ValueError("Pump volume, flow and derived duration do not agree")
+            raise ConfigurationError("Pump volume, flow and derived duration do not agree")
         after = self.hardware()
         if after["signature"] != expected_signature or after["force_percent"] != dose.force_percent:
-            raise ValueError("Pump configuration changed during preparation")
+            raise ConfigurationError("Pump configuration changed during preparation")
         return {"target_ml": target, "flow_ml_min": speed, "device_duration_s": seconds,
                 "expected_duration_s": expected_s, "hardware": after}
 
@@ -220,13 +220,17 @@ class PumpWorker:
             self.publish_status(current)
             if current["state"] != 3:
                 self.ensure_stopped()
-                raise RuntimeError("Pump moved during final accounting")
-            if abs(current["counter_ml"]-previous["counter_ml"]) > max(current["resolution_ml"], previous["resolution_ml"])+1e-10:
+                raise AccountingError("Pump moved during final accounting")
+            # Stability is not an allowance for dose error. Even one counter
+            # tick restarts the stable window; scale changes do so as well.
+            if (not math.isclose(current["counter_ml"], previous["counter_ml"], rel_tol=0.,
+                                 abs_tol=min(current["resolution_ml"], previous["resolution_ml"])*1e-6)
+                    or current["resolution_ml"] != previous["resolution_ml"]):
                 stable_at = time.monotonic()
             previous = current
             if time.monotonic()-begin >= 1.2 and time.monotonic()-stable_at >= .4:
                 return current
-        raise RuntimeError("Final pump counter has not settled")
+        raise AccountingError("Final pump counter has not settled")
 
     def _finish_context(self, recovered=False):
         ctx = self.context
@@ -253,17 +257,19 @@ class PumpWorker:
                 evidence.get("stop_sent_at", 0)-pre["read_at"] <= 1 and
                 amount is not None and margin > 0 and
                 stopped_at < evidence.get("started_at", 0)+dose.cap/dose.flow_ml_min*60)
-        error = ctx["error"]
+        error, error_kind = ctx["error"], ctx.get("error_kind", "")
         if ctx["started"] and amount is not None:
             evidence["deviation_ml"] = amount-dose.volume_ml
             if not ctx["interrupted"] and not recovered and dose.purpose != "stop_test":
                 tolerance = max(ctx["before"]["resolution_ml"]+final["resolution_ml"], dose.volume_ml*.05)+1e-10
                 if abs(amount-dose.volume_ml) > tolerance:
                     error = "Pump stopped with verified under-delivery; inspect pump and tubing"
+                    error_kind = "accounting_error"
         if final["error"]:
             error = f"Pump protection fault {final['error']}"
+            error_kind = "pump_fault"
         result = DoseResult(dose.id, True, stopped_at, amount, source, ctx["started"], error,
-                            ctx["interrupted"], recovered, evidence)
+                            ctx["interrupted"], recovered, evidence, error_kind)
         if amount is None:
             self.emit("dose_pending", asdict(result))
             return False
@@ -274,14 +280,16 @@ class PumpWorker:
 
     def execute(self, dose):
         self.context = {"dose": dose, "started": False, "before": None,
-                        "error": "", "interrupted": False, "evidence": {}}
+                        "error": "", "error_kind": "", "interrupted": False, "evidence": {}}
         ctx = self.context
         phase = "preflight"
         try:
             initial = self.transport.status()
             self.publish_status(initial)
-            if initial["state"] != 3 or initial["error"]:
-                raise ValueError("Pump must be stopped without a hardware fault")
+            if initial["error"]:
+                raise ProtectionError(f"Pump protection fault {initial['error']}")
+            if initial["state"] != 3:
+                raise ConfigurationError("Pump must be stopped before preparation")
             ctx["before"] = initial
             signature = self.hardware["signature"]
             phase = "preparing"
@@ -292,8 +300,10 @@ class PumpWorker:
             ctx["evidence"]["parameters"] = verified
             fresh = self.transport.status()
             self.publish_status(fresh)
-            if fresh["state"] != 3 or fresh["error"]:
-                raise ValueError("Pump stopped state changed before START")
+            if fresh["error"]:
+                raise ProtectionError(f"Pump protection fault {fresh['error']}")
+            if fresh["state"] != 3:
+                raise ConfigurationError("Pump stopped state changed before START")
             ctx["before"] = fresh
             if not self.authorize(dose, {"before": fresh, "hardware": self.hardware}):
                 raise RuntimeError("Injection intent could not be persisted or was cancelled")
@@ -323,7 +333,7 @@ class PumpWorker:
                     s = self.transport.status()
                     self.publish_status(s)
                     if s["error"]:
-                        raise RuntimeError(f"Pump protection fault {s['error']}")
+                        raise ProtectionError(f"Pump protection fault {s['error']}")
                     if s["state"] == 3:
                         ctx["evidence"]["native_stop_at"] = s["read_at"]
                         break
@@ -334,7 +344,7 @@ class PumpWorker:
                         ctx["evidence"]["software_cutoff_basis"] = "device_counter"
                         break
                     if s["state"] != 1:
-                        raise RuntimeError("Unexpected pump motion state")
+                        raise ConfigurationError("Unexpected pump motion state")
                     next_poll = time.monotonic()+.5
             if dose.purpose == "stop_test" and not ctx["interrupted"]:
                 ctx["evidence"]["pre_stop"] = self.transport.status(emergency=True)
@@ -343,6 +353,7 @@ class PumpWorker:
             ctx["interrupted"] = True
         except Exception as exc:
             ctx["error"] = f"{phase}: {exc}"
+            ctx["error_kind"] = failure_kind(exc)
             ctx["interrupted"] = ctx["started"]
         finally:
             self.emit("pump_phase", {"phase": "confirming_stop", "id": dose.id})
@@ -352,7 +363,7 @@ class PumpWorker:
             except Exception as exc:
                 self.connected = False
                 self.emit("dose_pending", asdict(DoseResult(dose.id, False, time.monotonic(), None,
-                    "unverified", ctx["started"], str(exc), ctx["interrupted"], evidence=ctx["evidence"])))
+                    "unverified", ctx["started"], str(exc), ctx["interrupted"], evidence=ctx["evidence"], error_kind=failure_kind(exc))))
                 raise
             finally:
                 self.stop_event.clear()
@@ -378,7 +389,8 @@ class PumpWorker:
                     expected = self.context["evidence"].get("parameters", {}).get("hardware", {}).get("signature")
                     if expected == self.hardware["signature"]:
                         # A trustworthy final count resolves communication interruption.
-                        self.context["error"] = "" if not self.status["error"] else self.context["error"]
+                        if not self.status["error"] and self.context.get("error_kind") == "communication_error":
+                            self.context["error"] = self.context["error_kind"] = ""
                         try:
                             self._finish_context(recovered=True)
                         except Exception as exc:

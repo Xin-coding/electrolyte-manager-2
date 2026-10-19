@@ -15,6 +15,7 @@ from .paths import atomic_json, diagnostic_logger, keep_awake, read_json, root_d
 from .storage import Store, mark_interrupted
 from .devices.sensors import SensorWorker, ports, identify
 from .devices.pump import PumpWorker
+from .errors import ParameterError
 
 
 class Runtime:
@@ -44,7 +45,14 @@ class Runtime:
         self.log = diagnostic_logger(self.root)
         self.config_file = self.root/"data"/"settings.json"
         self.ledger_file = self.root/"data"/"load.json"
-        settings = Settings.from_dict(read_json(self.config_file, {}))
+        saved_settings = read_json(self.config_file, {})
+        try:
+            settings = Settings.from_dict(saved_settings)
+        except ParameterError as exc:
+            # Older profiles may contain previously accepted precision errors.
+            # Keep them editable and allow recording; enable() still validates.
+            settings = Settings.from_dict(saved_settings, validate=False)
+            self.notices.append({"time": utc_now(), "kind": "error", "data": {"error": str(exc)}})
         ledger = read_json(self.ledger_file, {})
         load = Load(**ledger.get("load", {}))
         if ledger.get("intent"):
@@ -54,6 +62,8 @@ class Runtime:
         self.scan_busy = False
         self.finish_pending = False
         self.pending_reason = ""
+        self.last_failure = None
+        self.last_results = {"experiment": None, "test": None}
         self.pending_allowance = None
         self.last_pump_sample = 0.
         self.local_storage_error = ""
@@ -247,6 +257,14 @@ class Runtime:
                 self.store.event(self.elapsed(), name, data)
         elif name in {"dose_result", "dose_pending"}:
             result = DoseResult(**data)
+            dose = e.active
+            if dose and dose.id == result.id:
+                entry = {"time": utc_now(), "dose": asdict(dose), "result": data}
+                self.last_results["experiment" if dose.purpose == "experiment" else "test"] = entry
+                if result.error or not result.stopped or result.amount_ml is None:
+                    self.last_failure = entry
+                elif name == "dose_result":
+                    self.last_failure = None
             e.complete(result)
             if name == "dose_pending":
                 self.pending_reason = result.error or "Final dose is unknown; verify the delivered amount"
@@ -320,12 +338,11 @@ class Runtime:
                 raise ValueError("Confirm the current syringe information")
             self.confirmed_signature = self.hardware["signature"]
             d = Dose(**data)
-            if not all(finite(x) and x > 0 for x in (d.volume_ml, d.flow_ml_min, d.cap)) or not 20 <= d.force_percent <= 100:
-                raise ValueError("Invalid pump test parameters")
-            if d.purpose == "stop_test" and d.cap <= d.volume_ml:
-                raise ValueError("STOP test hardware cap must exceed its software cutoff")
-            if not e.connected["pump"] or not e.hardware_ready:
-                raise ValueError("Pump stop must be confirmed")
+            reason = self.test_block_reason(d.cap)
+            if reason:
+                raise ValueError(reason)
+            if d.cap > self.hardware["capacity_ml"]+1e-10:
+                raise ParameterError("Dose exceeds syringe capacity")
             if self.bench is None:
                 self.bench_epoch = time.monotonic()
                 self.bench = Store.create(self.root/"data/tests", "Pump_test", {})
@@ -343,6 +360,11 @@ class Runtime:
         else:
             raise ValueError("Unsupported application command")
 
+    def test_block_reason(self, cap=None):
+        if self.pump_status.get("error"):
+            return "pump_fault"
+        return self.engine.test_block_reason(cap)
+
     def publish(self):
         e = self.engine
         self.snapshot = copy.deepcopy({
@@ -358,6 +380,8 @@ class Runtime:
             "notices": list(self.notices)[-30:], "scan_busy": self.scan_busy,
             "pending_reason": self.pending_reason, "storage_error": self.local_storage_error or (self.store.error if self.store else ""),
             "pending_allowance": self.pending_allowance,
+            "test_block_reason": self.test_block_reason(),
+            "last_failure": self.last_failure, "last_results": self.last_results,
             "confirmed_signature": self.confirmed_signature})
 
     def run(self):

@@ -1,8 +1,10 @@
-# Validation status — 2.0.0
+# Validation status — 2.0.1
 
 This document distinguishes executable software checks, instrument evidence and checks that require more elapsed time or external measurement.
 
 Version 2.0.0 was approved for general release on 2026-10-19. Release status does not change the validation results below.
+
+Version 2.0.1 adds 32 automated regressions (83 passing tests in total) and a fresh local small-dose bench run. The 2.0.0 test suite had not exercised formal form input through actual Modbus serialization, allowing a floating-point force bug to escape. This gap and the fixes are documented in [2.0.1 changes](CHANGES_2_0_1.md). Earlier acceptance below is retained as historical evidence; the outstanding physical and endurance limitations still apply.
 
 ## Completed
 

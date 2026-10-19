@@ -5,6 +5,8 @@ import math
 import re
 import struct
 
+from ..errors import ParameterError, CommunicationError
+
 
 def crc(data):
     value = 0xffff
@@ -16,6 +18,17 @@ def crc(data):
 
 
 def packet(function, register, values, address=1):
+    for name, value, maximum in (("address", address, 255), ("function", function, 255), ("register", register, 65535)):
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ParameterError(f"Pump packet {name} must be an integer in 0..{maximum}")
+    words = values if function == 16 else [values]
+    if not isinstance(words, (list, tuple)) or not words:
+        raise ParameterError("Pump packet register values must be a non-empty integer sequence")
+    for index, value in enumerate(words):
+        if type(value) is not int or not 0 <= value <= 65535:
+            raise ParameterError(f"Pump register 0x{register+index:04X}: expected integer 0..65535, got {value!r}")
+    if function == 16 and len(words) > 123:
+        raise ParameterError("Too many pump register values")
     if function in (3, 6):
         body = struct.pack(">BBHH", address, function, register, values)
     elif function == 16:
@@ -28,19 +41,19 @@ def packet(function, register, values, address=1):
 
 def response(raw, function, address=1):
     if len(raw) < 5 or crc(raw[:-2]) != raw[-2:]:
-        raise ValueError("Incomplete or corrupt pump response")
+        raise CommunicationError("Incomplete or corrupt pump response")
     if raw[0] != address:
-        raise ValueError("Pump address mismatch")
+        raise CommunicationError("Pump address mismatch")
     if raw[1] == function | 128:
-        raise RuntimeError(f"Pump protocol exception {raw[2]}")
+        raise CommunicationError(f"Pump protocol exception {raw[2]}")
     if raw[1] != function:
-        raise ValueError("Pump function mismatch")
+        raise CommunicationError("Pump function mismatch")
     if function == 3:
         if len(raw) != raw[2]+5 or raw[2] % 2:
-            raise ValueError("Pump register response length mismatch")
+            raise CommunicationError("Pump register response length mismatch")
         return list(struct.unpack(">"+"H"*(raw[2]//2), raw[3:-2]))
     if len(raw) != 8:
-        raise ValueError("Pump write response length mismatch")
+        raise CommunicationError("Pump write response length mismatch")
     return struct.unpack(">HH", raw[2:6])
 
 

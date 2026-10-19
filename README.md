@@ -1,5 +1,7 @@
 # Electrolyte Manager 2.0
 
+Current version: **2.0.1**. This maintenance release fixes formal-feedback force encoding, validates pump precision before parameter writes, corrects final-counter stability detection, and distinguishes preparation errors from hardware faults. See [changes and regression evidence](docs/CHANGES_2_0_1.md).
+
 Independent Windows acquisition and syringe-pump feedback software for Metrohm 781, Apera PC8500 and Longer ASP. This is a fresh Python / PySide6 application; the previous application is not its code baseline. Hardware protocols and observed firmware behavior were used as references.
 
 ## Run the portable application

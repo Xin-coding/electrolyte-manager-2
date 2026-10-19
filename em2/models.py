@@ -6,6 +6,9 @@ import math
 from typing import Literal
 from uuid import uuid4
 
+from .errors import ParameterError
+from .parameters import force_integer, pump_parameters
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -59,7 +62,7 @@ class Settings:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, *, validate=True):
         keys = set(cls.__dataclass_fields__)
         if not isinstance(data, dict) or set(data)-keys:
             raise ValueError("Unsupported settings fields")
@@ -67,7 +70,8 @@ class Settings:
         for kind in ("ph", "ec"):
             value[kind] = SignalSettings(**value.get(kind, {}))
         result = cls(**value)
-        result.validate()
+        if validate:
+            result.validate()
         return result
 
     def validate(self, complete=False):
@@ -81,8 +85,9 @@ class Settings:
             v = getattr(self, key)
             if v is not None and (not finite(v) or v < 0 or key != "mix_s" and v == 0):
                 raise ValueError(f"Invalid {key}")
-        if self.force_percent is not None and (not finite(self.force_percent) or int(self.force_percent) != self.force_percent or not 20 <= self.force_percent <= 100):
-            raise ValueError("Pump force must be an integer from 20 to 100 percent")
+        if self.force_percent is not None:
+            self.force_percent = force_integer(self.force_percent)
+        pump_parameters(self.dose_ml, self.flow_ml_min, self.force_percent, self.mix_s)
         self.ph.validate(complete and self.control == "ph")
         self.ec.validate(complete and self.control == "ec")
         if complete and any(getattr(self, k) is None for k in ("dose_ml", "flow_ml_min", "mix_s", "force_percent")):
@@ -142,6 +147,21 @@ class Dose:
     settings_version: int = 0
     id: str = field(default_factory=lambda: uuid4().hex)
 
+    def __post_init__(self):
+        object.__setattr__(self, "force_percent", force_integer(self.force_percent))
+        if not finite(self.volume_ml) or self.volume_ml <= 0 or not finite(self.flow_ml_min) or self.flow_ml_min <= 0:
+            raise ParameterError("Dose volume and flow must be positive")
+        if not finite(self.mix_s) or self.mix_s < 0:
+            raise ParameterError("Mixing time must be non-negative")
+        if self.purpose not in {"experiment", "test", "stop_test"}:
+            raise ParameterError("Invalid dose purpose")
+        if self.purpose == "stop_test":
+            if self.hardware_cap_ml is None or not finite(self.cap) or self.cap <= self.volume_ml:
+                raise ParameterError("STOP test hardware cap must exceed its software cutoff")
+        elif self.hardware_cap_ml is not None and self.hardware_cap_ml != self.volume_ml:
+            raise ParameterError("Finite dose hardware cap must equal the requested volume")
+        pump_parameters(self.cap, self.flow_ml_min, self.force_percent, self.mix_s)
+
     @property
     def cap(self):
         return self.volume_ml if self.hardware_cap_ml is None else self.hardware_cap_ml
@@ -163,3 +183,4 @@ class DoseResult:
     interrupted: bool = False
     recovered: bool = False
     evidence: dict = field(default_factory=dict)
+    error_kind: str = ""

@@ -13,8 +13,9 @@ import pyqtgraph.exporters
 from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
 
 from . import storage
+from . import __version__
 from .devices.sensors import ports
-from .models import Settings
+from .models import Settings, Dose
 from .paths import atomic_json, read_json
 from .units import hydroxide
 
@@ -35,6 +36,7 @@ QPushButton:hover { border-color: #1685b2; background: #edf7fc; }
 QPushButton:disabled { color: #9caebb; background: #edf1f5; }
 QPushButton#primary { background: #076e9a; border-color: #076e9a; color: white; font-weight: 600; }
 QPushButton#danger { background: #b83645; color: white; border-color: #b83645; font-weight: 700; }
+QPushButton#primary:disabled, QPushButton#danger:disabled { background: #edf1f5; color: #9caebb; border-color: #c9d7e3; }
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
  background: white; border: 1px solid #c9d7e3; border-radius: 4px; padding: 5px; }
 QLineEdit:focus, QComboBox:focus { border-color: #087ba9; }
@@ -55,6 +57,10 @@ STATE_ZH = {
     "allowance_exhausted": "余量不足完整一针", "manual_pause": "反馈已手动暂停",
     "emergency_stop": "急停已请求，需手动继续", "alarm_paused": "信号报警，暂停加液",
     "storage_paused": "存储失败，反馈已暂停", "pump_fault": "泵故障，需核实后继续",
+    "parameter_error": "泵参数无效，修改后可继续", "configuration_error": "泵参数读回不一致，需核实",
+    "communication_error": "泵通信异常，需核实后继续", "software_error": "软件执行错误，反馈已暂停",
+    "accounting_error": "注射计量需核实", "pump_disconnected": "泵未连接",
+    "pump_busy": "泵正被注射或计量占用", "feedback_reserved": "反馈占用泵",
     "hardware_changed": "注射器信息已变更，需重新确认", "ending": "正在结束实验",
     "manual_review": "计量已人工确认，需手动继续", "pump_unavailable": "泵暂不可用"}
 
@@ -103,6 +109,26 @@ def fmt(value, digits=3):
     return "—" if value is None or not math.isfinite(value) else f"{value:.{digits}f}"
 
 
+def dose_result_text(entry, zh):
+    if not entry:
+        return ""
+    dose, result = entry["dose"], entry["result"]
+    purpose = {"experiment": ("正式注射", "Experiment dose"), "test": ("定量测试", "Finite test"),
+               "stop_test": ("软件 STOP 测试", "Software STOP test")}[dose["purpose"]][0 if zh else 1]
+    kind = result.get("error_kind") or ("pump_fault" if result.get("error") else "")
+    category = STATE_ZH.get(kind, kind) if zh else kind.replace("_", " ")
+    start = ("已尝试发送" if result["started"] else "未发送") if zh else ("attempted" if result["started"] else "not sent")
+    text = (f"{entry['time'][11:19]} · {purpose} · "
+            f"{'设定' if zh else 'Requested'} {fmt(dose['volume_ml'])} mL · "
+            f"{'记账' if zh else 'Accounted'} {fmt(result['amount_ml'])} mL\n"
+            f"START: {start} · {'停止已确认' if zh else 'Stop confirmed'}: {result['stopped']} · Source: {result['source']}")
+    if dose["purpose"] == "stop_test":
+        text += f" · STOP test passed: {result['evidence'].get('stop_test_passed', False)}"
+    if result.get("error"):
+        text += f"\n{category}: {result['error']}"
+    return text
+
+
 class Window(W.QMainWindow):
     def __init__(self, runtime):
         super().__init__()
@@ -133,7 +159,7 @@ class Window(W.QMainWindow):
         outer.setContentsMargins(20, 16, 20, 12)
         brand = W.QLabel("Electrolyte Manager")
         brand.setObjectName("title")
-        subtitle = self.label("电解液实验工作台 · 2.0.0", "Laboratory workspace · 2.0.0")
+        subtitle = self.label(f"电解液实验工作台 · {__version__}", f"Laboratory workspace · {__version__}")
         subtitle.setObjectName("subtitle")
         brandcol = W.QVBoxLayout()
         brandcol.addWidget(brand)
@@ -332,8 +358,9 @@ class Window(W.QMainWindow):
                               ("测试推力 (%)", "Test force (%)", self.test_force)):
             form.addRow(self.label(zh, en), field)
         self.test_cap.setToolTip("STOP 测试：泵端限量必须大于软件停止量。\nThe finite hardware cap must exceed the software cutoff.")
-        row = layout_row(self.button("单次定量测试", "Run finite dose", lambda: self.start_test(False), "primary"),
-                         self.button("软件 STOP 测试", "Run software STOP test", lambda: self.start_test(True)))
+        self.finite_test_button = self.button("单次定量测试", "Run finite dose", lambda: self.start_test(False), "primary")
+        self.stop_test_button = self.button("软件 STOP 测试", "Run software STOP test", lambda: self.start_test(True))
+        row = layout_row(self.finite_test_button, self.stop_test_button)
         form.addRow(row)
         box.addWidget(group)
         self.test_state = W.QLabel()
@@ -374,15 +401,29 @@ class Window(W.QMainWindow):
         answer = W.QMessageBox.question(self, title, text, W.QMessageBox.StandardButton.Ok | W.QMessageBox.StandardButton.Cancel)
         return signature if answer == W.QMessageBox.StandardButton.Ok else None
 
-    def start_test(self, stop_test):
+    def test_data(self, stop_test):
         volume, flow, force = number(self.test_volume), number(self.test_flow), number(self.test_force)
-        if None in (volume, flow, force) or force != int(force):
+        if None in (volume, flow, force):
             raise ValueError("Set test volume, flow and integer force")
         cap = number(self.test_cap) if stop_test else None
         if stop_test and cap is None:
             raise ValueError("Set a finite pump hardware cap above the software cutoff")
-        data = {"volume_ml": volume, "flow_ml_min": flow, "force_percent": int(force),
+        data = {"volume_ml": volume, "flow_ml_min": flow, "force_percent": force,
                 "purpose": "stop_test" if stop_test else "test", "hardware_cap_ml": cap}
+        validated = Dose(**data)
+        data["force_percent"] = validated.force_percent
+        snap = self.runtime.snapshot
+        reason = snap.get("test_block_reason", "pump_disconnected")
+        if reason:
+            raise ValueError(STATE_ZH.get(reason, reason) if self.language == "zh" else reason.replace("_", " "))
+        if validated.cap > snap["hardware"]["capacity_ml"]+1e-10:
+            raise ValueError("Dose exceeds syringe capacity / 剂量超过注射器容量")
+        if snap["remaining"] is not None and validated.cap > snap["remaining"]+1e-10:
+            raise ValueError("Insufficient load allowance / 可用额度不足")
+        return data
+
+    def start_test(self, stop_test):
+        data = self.test_data(stop_test)
         signature = self.confirm_hardware(data)
         if signature:
             self.runtime.command("test", signature=signature, **data)
@@ -576,6 +617,10 @@ class Window(W.QMainWindow):
         self.monitor_status.setObjectName("status")
         self.monitor_status.setWordWrap(True)
         box.addWidget(self.monitor_status)
+        self.dose_result_label = W.QLabel()
+        self.dose_result_label.setWordWrap(True)
+        self.dose_result_label.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(self.dose_result_label)
         self.ph_axis = W.QComboBox()
         self.ph_axis.addItems(["pH", "Estimated OH⁻ (mmol/L)"])
         self.raw_check = W.QCheckBox("Raw")
@@ -838,7 +883,25 @@ class Window(W.QMainWindow):
         detail = (f"{status}  ·  目标 {fmt(s['target'])}  ·  混合剩余 {s['mix_remaining']:.1f} s  ·  设置 v{s['settings']['version']}" if zh else
                   f"{status}  ·  Target {fmt(s['target'])}  ·  Mix {s['mix_remaining']:.1f} s  ·  Settings v{s['settings']['version']}")
         self.monitor_status.setText(detail+("  ·  "+s["pending_reason"] if s["pending_reason"] else ""))
-        self.test_state.setText(("正在测试 / 准备" if zh else "Test active / preparing")+f" · {STATE_ZH.get(s['phase'],s['phase']) if zh else s['phase']}" if s["active"] else ("反馈占用泵" if s["enabled"] and zh else "Pump reserved by feedback" if s["enabled"] else "就绪，可独立测试" if zh else "Ready for independent test"))
+        block = s.get("test_block_reason", "pump_disconnected")
+        test_errors = []
+        for stop_test, button in ((False, self.finite_test_button), (True, self.stop_test_button)):
+            try:
+                self.test_data(stop_test)
+                button.setEnabled(True)
+                button.setToolTip("")
+                test_errors.append("")
+            except (ValueError, TypeError) as exc:
+                button.setEnabled(False)
+                button.setToolTip(str(exc))
+                test_errors.append(str(exc))
+        self.test_state.setText((STATE_ZH.get(block, block) if zh else block.replace("_", " ")) if block else
+                                (("就绪，可独立测试" if zh else "Ready for independent test") if "" in test_errors else
+                                 ("请检查测试参数：" if zh else "Check test parameters: ")+test_errors[0]))
+        latest = s.get("last_failure") or s.get("last_results", {}).get("experiment")
+        self.dose_result_label.setText(dose_result_text(latest, zh))
+        self.dose_result_label.setVisible(bool(latest))
+        self.dose_result_label.setStyleSheet("color: #b83645;" if s.get("last_failure") else "")
         h = s["hardware"]
         self.hardware_text.setPlainText((f"注射器容量：{fmt(h.get('capacity_ml'))} mL\n有效面积：{fmt(h.get('area_mm2'))} mm²\n仪器推力：{fmt(h.get('force_percent'),0)} %\n注射器型号与校准历史：仪器未提供，可在实验设置中添加备注。" if zh else
                                         f"Syringe capacity: {fmt(h.get('capacity_ml'))} mL\nEffective area: {fmt(h.get('area_mm2'))} mm²\nInstrument force: {fmt(h.get('force_percent'),0)} %\nSyringe model and calibration history are not provided. Add a note in Settings."))
@@ -894,19 +957,7 @@ class Window(W.QMainWindow):
         if self.event_log.toPlainText() != text:
             self.event_log.setPlainText(text)
             self.event_log.verticalScrollBar().setValue(self.event_log.verticalScrollBar().maximum())
-        tests = [n for n in s["notices"] if n["kind"] in {"dose_accounted", "dose_pending", "error"}]
-        results = []
-        for n in tests[-3:]:
-            d = n["data"]
-            if n["kind"] == "dose_accounted":
-                dose, result = d["dose"], d["result"]
-                results.append(f"{n['time'][11:19]}  {'定量测试结果' if zh else 'Dose result'}\n"
-                               f"{'设定量' if zh else 'Requested'}: {fmt(dose['volume_ml'])} mL · {'实际记账' if zh else 'Accounted'}: {fmt(result['amount_ml'])} mL\n"
-                               f"{'已确认停止' if zh else 'Stop confirmed'}: {result['stopped']} · {'计量来源' if zh else 'Source'}: {result['source']}\n"
-                               f"STOP test: {result['evidence'].get('stop_test_passed','—')}\n{result['error']}")
-            else:
-                results.append(f"{n['time'][11:19]}  {d.get('error','计量待核实 / Accounting pending')}")
-        resulttext = "\n\n".join(results)
+        resulttext = dose_result_text(s.get("last_results", {}).get("test"), zh)
         if self.test_results.toPlainText() != resulttext:
             self.test_results.setPlainText(resulttext)
         errors = [n for n in s["notices"] if n["kind"] == "error"]

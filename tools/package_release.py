@@ -12,6 +12,8 @@ import urllib.request
 import zipfile
 
 source = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(source))
+from em2 import __version__
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source-ref', default='HEAD', help='Git ref of the packaged application code')
 args = parser.parse_args()
@@ -36,10 +38,10 @@ for name,url in (("LGPL-3.0.txt","https://www.gnu.org/licenses/lgpl-3.0.txt"),
         with urllib.request.urlopen(url,timeout=30) as response:
             target.write_bytes(response.read())
 
-archive = root/"ElectrolyteManager-2.0.0-Windows-x64.zip"
+archive = root/f"ElectrolyteManager-{__version__}-Windows-x64.zip"
 commit = subprocess.check_output(["git","rev-parse",args.source_ref+'^{commit}'],cwd=source,text=True).strip()
 documentation_commit = subprocess.check_output(["git","rev-parse","HEAD"],cwd=source,text=True).strip()
-manifest = {"version":"2.0.0","source_commit":commit,"built_utc":datetime.now(timezone.utc).isoformat(),
+manifest = {"version":__version__,"source_commit":commit,"built_utc":datetime.now(timezone.utc).isoformat(),
             "release_channel":"stable", "documentation_commit":documentation_commit,
             "validation":"24 h endurance not completed: run ended after approximately 1 h 12 min; external gravimetric and physical fault-injection validation remain incomplete",
             "dependencies":{n:metadata.version(n) for n in ("PySide6","pyqtgraph","pyserial","numpy")}}
