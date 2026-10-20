@@ -17,6 +17,8 @@ from .storage import Store, mark_interrupted, recover_injection
 from .devices.sensors import SensorWorker, ports, identify
 from .devices.pump import PumpWorker
 from .errors import ParameterError
+from .charge import Charge, current_value
+from .forms import parse_number
 
 
 class Runtime:
@@ -75,6 +77,11 @@ class Runtime:
         self.pending_allowance = None
         self.last_pump_sample = 0.
         self.local_storage_error = ""
+        self.charge = Charge()
+        self.finish_context = None
+        self.finish_retry_at = 0.
+        self.export_pending = None
+        self.last_completed = None
         self.thread = threading.Thread(target=self.run, name="em2-service", daemon=True)
         self.thread.start()
 
@@ -119,7 +126,7 @@ class Runtime:
         entry = {"time": utc_now(), "kind": name, "data": data}
         if name not in {"decision", "pump_progress"}:
             self.notices.append(entry)
-        if self.store:
+        if self.store and self.finish_context is None:
             self.store.event(now, name, data)
         if self.bench and name in {"dose_accounted", "refill", "allowance_changed"}:
             self.bench.event(time.monotonic()-self.bench_epoch, name, data)
@@ -285,7 +292,7 @@ class Runtime:
             sample = Sample(**data, sequence=self.sequence[kind])
             filtered = e.observe(sample)
             self.samples[kind] = {**asdict(sample), "filtered": filtered}
-            if self.store:
+            if self.store and self.finish_context is None:
                 self.store.sample(max(0, sample.mono-self.epoch), sample, filtered)
         elif name == "connection":
             kind = data["kind"]
@@ -358,6 +365,8 @@ class Runtime:
 
     def dispatch(self, name, data):
         e = self.engine
+        if self.finish_pending and name in {"start_recording", "enable", "test", "apply", "allowance"}:
+            raise ValueError("Wait for experiment finalization")
         if name in {"test", "enable"}:
             generation = data.pop("_stop_generation", self.stop_generation)
             if generation != self.stop_generation or self.priority_stop:
@@ -380,16 +389,22 @@ class Runtime:
                 raise ValueError("An experiment is already recording")
             if e.active:
                 raise ValueError("Wait for the pump to stop")
+            if self.export_pending:
+                raise ValueError("Wait for the completed experiment export to be queued")
             new_store = Store.create(self.root/"data", data.get("name", "Experiment"), e.settings.payload())
             e.begin()
             self.epoch = time.monotonic()
+            self.charge.begin(self.epoch, current_value(e.settings.metadata))
+            self.finish_context = None
+            self.last_completed = None
             self.store = new_store
             self.store.put("settings", (e.settings.version, 0., e.settings.payload()))
             self.store.event(0, "recording_started", {"bindings": {k: asdict(v) for k, v in self.bindings.items()}, "load": asdict(e.load)})
             keep_awake(True)
         elif name == "finish":
-            e.pause("ending")
-            self.finish_pending = True
+            if self.store and not self.finish_pending:
+                e.pause("ending")
+                self.finish_pending = True
         elif name == "enable":
             if self.local_storage_error:
                 self.persist_ledger()
@@ -401,7 +416,23 @@ class Runtime:
         elif name == "pause":
             e.pause(data.get("reason", "manual_pause"))
         elif name == "apply":
-            e.apply(Settings.from_dict(data["settings"]), time.monotonic())
+            if self.finish_pending:
+                raise ValueError("Wait for experiment finalization")
+            settings = Settings.from_dict(data["settings"])
+            raw_current = settings.metadata.get("current_a", "")
+            value, issue = parse_number(str(raw_current if raw_current is not None else ""))
+            if issue:
+                raise ValueError("Current (A): "+issue[1])
+            previous = current_value(e.settings.metadata)
+            now = time.monotonic()
+            e.apply(settings, now)
+            if self.store and value != previous:
+                self.charge.change(now, value)
+                self.event("current_changed", {"old_a": previous, "new_a": value,
+                                              "effective_t": now-self.epoch})
+        elif name == "export_ack":
+            if self.export_pending and self.export_pending["path"] == data["path"]:
+                self.export_pending = None
         elif name == "allowance":
             if not e.connected["pump"] or (self.pump_status.get("state") != 3 and (data.get("refill") or not e.active)):
                 raise ValueError("Connect the pump and confirm stopped before changing the load")
@@ -460,6 +491,8 @@ class Runtime:
             "pump": self.pump_status, "phase": self.phase, "progress": self.progress,
             "active": asdict(e.active) if e.active else None, "state": e.state, "enabled": e.enabled,
             "recording": e.recording, "path": str(self.store.path) if self.store else "",
+            "finishing": self.finish_pending, "export_pending": self.export_pending,
+            "last_completed": self.last_completed, "charge": self.charge.snapshot(time.monotonic()),
             "test_path": str(self.bench.path) if self.bench else "", "samples": self.samples,
             "target": e.target, "auto_target": e.auto_target, "mix_remaining": max(0., e.ready_at-time.monotonic()),
             "cumulative_ml": e.cumulative_ml, "elapsed": self.elapsed() if self.store else 0,
@@ -495,14 +528,8 @@ class Runtime:
                         if worker:
                             worker.stop("alarm" if e.alarm else e.manual_reason)
                         e.stop_requested = False
-                    if self.finish_pending and not e.active:
-                        if self.store:
-                            self.store.close()
-                            self.store = None
-                        e.recording = False
-                        e.manual_reason = ""
-                        self.finish_pending = False
-                        keep_awake(False)
+                    if self.finish_pending and not e.active and not self.result_pending:
+                        self.finalize_recording()
                     if self.pending_allowance is not None and not e.active and time.monotonic() >= e.ready_at:
                         e.set_allowance(self.pending_allowance)
                         self.pending_allowance = None
@@ -531,6 +558,33 @@ class Runtime:
             for handler in list(self.log.handlers):
                 handler.close()
                 self.log.removeHandler(handler)
+
+    def finalize_recording(self):
+        if not self.store or time.monotonic() < self.finish_retry_at:
+            return
+        if self.finish_context is None:
+            now = time.monotonic()
+            self.charge.finish(now)
+            self.finish_context = {"duration": now-self.epoch, "ended": utc_now(),
+                                   "charge": self.charge.snapshot(now)}
+        context = self.finish_context
+        self.finish_retry_at = time.monotonic()+2
+        if not context.get("committed"):
+            if not self.store.finalize(context["duration"], context["charge"], context["ended"]):
+                self.pending_reason = "Waiting for database finalization: "+self.store.error
+                return
+            context["committed"] = True
+        path = str(self.store.path)
+        if not self.store.close(finalized=True):
+            self.pending_reason = "Database finalization failed: "+(self.store.error or "unflushed or dropped records")
+            return
+        self.store = None
+        self.last_completed = self.export_pending = {"path": path, **context}
+        self.engine.recording = False
+        self.engine.manual_reason = ""
+        self.finish_pending = False
+        self.pending_reason = ""
+        keep_awake(False)
 
     def close(self):
         pump = self.workers.get("pump")

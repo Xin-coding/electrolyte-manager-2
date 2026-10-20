@@ -1,4 +1,13 @@
-# Validation status — 2.0.3
+# Validation status — 2.1.0
+
+## Version 2.1.0 acceptance
+
+- **173 automated tests passed** locally, including historical pump alignment and exact step geometry, unknown/estimated volume handling, full-data exports, final-result-before-report ordering, failed finalization and export retry, normal-close rejection, input protection, and piecewise/zero/signed/missing/overflow current handling. Forty warnings are existing pyqtgraph default-parameter deprecations, not test failures.
+- Native Windows Qt rendering passed in Chinese and English. Reference lines do not affect signal y-axis bounds; history opens in a separate pump dialog. PNG files were visually inspected, including axis fonts and the exact step timing.
+- A pre-existing EM2 schema-1 database passed SQLite integrity checking. All **355** exported injection rows matched saved timestamps, per-dose amounts and cumulative values; the final total was **35.496 mL**, with two refill events. The original database SHA-256 was unchanged. No private database, identity or raw report is included here.
+- The rebuilt Windows portable application launched with Python paths removed, reported version **2.1.0**, used approximately **162.4 MiB** at startup and closed with exit code **0**. Its temporary data directory was isolated from production settings and syringe allowance state.
+- Hardware protocol modules, pump execution code and feedback decision code were unchanged. No physical device was connected or driven for this release. These tests do not complete the outstanding physical or endurance acceptance listed below.
+
 
 This document distinguishes executable software checks, instrument evidence and checks that require more elapsed time or external measurement.
 

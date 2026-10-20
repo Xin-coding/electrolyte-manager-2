@@ -170,6 +170,14 @@ class Store:
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?,?)", (data[0], data[1], compact(data[2])))
         elif kind == "injection":
             write_injection(db, data)
+        elif kind == "finalize":
+            db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                           [(key, compact(value)) for key, value in data.items()])
+
+    def finalize(self, duration, charge, ended):
+        """Acknowledge all preceding writes before declaring completion."""
+        return self.put("finalize", {"status": "completed", "duration_s": duration,
+                                    "charge": charge, "ended": ended}, critical=True)
 
     def _run(self):
         db = sqlite3.connect(self.path, timeout=.5)
@@ -234,15 +242,17 @@ class Store:
                 pass
             db.close()
 
-    def close(self, status="completed"):
+    def close(self, status="completed", finalized=False):
         if self.closed:
-            return
-        self.put("meta", ("status", status))
-        self.put("meta", ("ended", utc_now()))
+            return not self.thread.is_alive() and not self.error and self.queue.empty()
+        if not finalized:
+            self.put("meta", ("status", status))
+            self.put("meta", ("ended", utc_now()))
         self.closed = True
         self.close_deadline = self.clock()+4
         self.stop_event.set()
         self.thread.join(timeout=5)
+        return not self.thread.is_alive() and not self.error and self.queue.empty()
 
 
 def mark_interrupted(directory):
@@ -261,7 +271,12 @@ def mark_interrupted(directory):
 def summary(path):
     with readonly(path) as db:
         meta = {r[0]: json.loads(r[1]) for r in db.execute("SELECT key,value FROM meta")}
-        meta["duration"] = db.execute("SELECT COALESCE(MAX(t),0) FROM samples").fetchone()[0]
+        last = max(db.execute(f"SELECT COALESCE(MAX(t),0) FROM {table}").fetchone()[0]
+                   for table in ("samples", "injections", "events"))
+        duration = meta.get("duration_s")
+        if duration is None and meta.get("ended") and meta.get("started"):
+            duration = max(0., (datetime.fromisoformat(meta["ended"])-datetime.fromisoformat(meta["started"])).total_seconds())
+        meta["duration"] = max(last, duration or 0.)
         meta["path"] = str(path)
         return meta
 

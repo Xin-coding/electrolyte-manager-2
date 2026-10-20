@@ -184,9 +184,12 @@ def test_failed_results_keep_specific_reason_and_formal_label(tmp_path, kind):
         r.engine.tick(100.); r.publish(); w.refresh()
         assert r.snapshot["state"] == kind
         assert r.snapshot["last_failure"]["result"]["error"] == result.error
-        assert result.error in w.dose_result_label.text()
+        assert result.error in w.monitor_status.text()
         assert "正式注射" in w.dose_result_label.text()
-        assert "未发送" in w.dose_result_label.text()
+        w.show_pump()
+        w.refresh()
+        assert "未发送" in w.pump_detail.text()
+        assert result.error in w.pump_detail.text()
         assert not w.test_results.toPlainText()
         w.switch_language(1); w.refresh()
         assert "Experiment dose" in w.dose_result_label.text()

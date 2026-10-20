@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections import deque
 import json
 import math
 from pathlib import Path
@@ -12,7 +13,7 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
 
-from . import storage
+from . import storage, reporting, charts
 from . import __version__
 from .devices.sensors import ports
 from .models import Settings, Dose
@@ -176,6 +177,7 @@ class Window(W.QMainWindow):
         self.language = read_json(self.root/"data/ui.json", {}).get("language", "zh")
         self.localized = []
         self.callbacks = {}
+        self.error_callbacks = {}
         self.jobs = {}
         self.next_job = 0
         self.pool = C.QThreadPool(self)
@@ -185,10 +187,16 @@ class Window(W.QMainWindow):
         self.last_error = ""
         self.last_path = ""
         self.popup = None
+        self.history_popup = None
+        self.history_generation = 0
+        self.bundle_queue = deque()
+        self.bundle_active = None
+        self.failed_exports = []
+        self.export_seen = deque(maxlen=32)
         self.notice_text = ""
         self.closing = False
         self.inventory = []
-        self.setWindowTitle("Electrolyte Manager 2.0")
+        self.setWindowTitle("Electrolyte Manager "+__version__)
         self.resize(1420, 930)
         self.setMinimumSize(1100, 760)
         self.setStyleSheet(STYLE)
@@ -235,7 +243,11 @@ class Window(W.QMainWindow):
         self.footer = W.QLabel()
         self.footer.setWordWrap(True)
         self.footer.setObjectName("status")
-        outer.addWidget(self.footer)
+        footer_row = layout_row(self.footer)
+        self.retry_export_button = self.button("重试导出", "Retry export", self.retry_exports)
+        self.retry_export_button.hide()
+        footer_row.addWidget(self.retry_export_button)
+        outer.addLayout(footer_row)
         self.apply_language()
         self.populate_settings(runtime.engine.settings.payload())
         self.refresh_ports()
@@ -276,21 +288,25 @@ class Window(W.QMainWindow):
         except Exception as exc:
             W.QMessageBox.warning(self, "Electrolyte Manager", str(exc))
 
-    def submit(self, function, callback=lambda result: None):
+    def submit(self, function, callback=lambda result: None, on_error=None):
         self.next_job += 1
         job = Job(self.next_job, function)
         self.jobs[self.next_job] = job
         self.callbacks[self.next_job] = callback
+        self.error_callbacks[self.next_job] = on_error
         job.signals.done.connect(self.job_done)
         self.pool.start(job)
 
     @C.Slot(int, object, str)
     def job_done(self, ident, result, error):
         callback = self.callbacks.pop(ident, None)
+        on_error = self.error_callbacks.pop(ident, None)
         self.jobs.pop(ident, None)
         if error:
             self.chart_busy = False
             self.notice_text = error
+            if on_error:
+                on_error(error)
             return
         if callback:
             self.guard(lambda: callback(result))
@@ -313,7 +329,8 @@ class Window(W.QMainWindow):
 
     def settings_edits(self):
         return {**self.fields, **{f"{kind}.{key}": edit for kind, fields in self.signal_fields.items()
-                                 for key, edit in fields.items() if key != "direction"}}
+                                 for key, edit in fields.items() if key != "direction"},
+                **({"metadata.current_a": self.meta_fields["current_a"]} if hasattr(self, "meta_fields") else {})}
 
     def test_edits(self):
         return {"volume_ml": self.test_volume, "flow_ml_min": self.test_flow,
@@ -625,9 +642,11 @@ class Window(W.QMainWindow):
                     ("counter_electrode", "对电极种类", "Counter electrode"),
                     ("syringe_note", "注射器 / 校准人工备注", "Syringe / calibration note"), ("notes", "其他备注", "Other notes")]
         for key, zh, en in metadata:
-            field = W.QLineEdit()
+            field = line_number() if key == "current_a" else W.QLineEdit()
             self.meta_fields[key] = field
-            form.addRow(self.label(zh, en), field)
+            form.addRow(self.label(zh, en), field.container if key == "current_a" else field)
+            if key == "current_a":
+                self.watch_number(field, self.validate_settings_form)
         box.addWidget(group)
         return scroll
 
@@ -695,7 +714,7 @@ class Window(W.QMainWindow):
     def make_plot(self, title, ylabel):
         plot = pg.PlotWidget(title=title)
         plot.setLabel("left", ylabel)
-        plot.setLabel("bottom", "Elapsed time", units="min")
+        charts.configure(plot)
         plot.showGrid(x=True, y=True, alpha=.13)
         plot.setMinimumHeight(210)
         plot.addLegend(offset=(10, 8))
@@ -722,17 +741,20 @@ class Window(W.QMainWindow):
         self.cards = {}
         for key, zh, en, unit in (("ph", "pH", "pH", "pH"), ("ec", "电导率", "Conductivity", "mS/cm"),
                                   ("temp", "温度", "Temperature", "°C"), ("used", "本次装液已用", "Load delivered", "mL"),
-                                  ("remaining", "可用额度剩余", "Allowance left", "mL"), ("pump", "泵状态", "Pump state", "")):
+                                  ("remaining", "可用额度剩余", "Allowance left", "mL"), ("charge", "累计电荷（估算）", "Estimated charge", "")):
             card = W.QFrame()
             card.setObjectName("card")
             v = W.QVBoxLayout(card)
             v.addWidget(self.label(zh, en))
             value = W.QLabel("—")
             value.setObjectName("cardValue")
-            if key == "pump":
+            if key == "charge":
                 value.setStyleSheet("font-size: 16pt;")
             v.addWidget(value)
-            v.addWidget(W.QLabel(unit))
+            unit_label = W.QLabel(unit)
+            v.addWidget(unit_label)
+            if key == "charge":
+                self.charge_unit = unit_label
             cards.addWidget(card, 1)
             self.cards[key] = value
         box.addLayout(cards)
@@ -744,6 +766,9 @@ class Window(W.QMainWindow):
         self.dose_result_label.setWordWrap(True)
         self.dose_result_label.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
         box.addWidget(self.dose_result_label)
+        self.reading_note = W.QLabel()
+        self.reading_note.setWordWrap(True)
+        box.addWidget(self.reading_note)
         self.ph_axis = W.QComboBox()
         self.ph_axis.addItems(["pH", "Estimated OH⁻ (mmol/L)"])
         self.raw_check = W.QCheckBox("Raw")
@@ -772,16 +797,10 @@ class Window(W.QMainWindow):
         for plot in (self.ph_plot, self.ec_plot):
             lines = [pg.InfiniteLine(angle=0, pen=pg.mkPen(color, style=C.Qt.PenStyle.DashLine)) for color in ("#dd9a25", "#dd9a25", "#d9636a", "#d9636a")]
             for line in lines:
-                plot.addItem(line)
+                plot.addItem(line, ignoreBounds=True)
                 line.hide()
             self.target_lines.append(lines)
-        self.reading_note = W.QLabel()
-        self.reading_note.setWordWrap(True)
-        box.addWidget(self.reading_note)
-        self.event_log = W.QPlainTextEdit()
-        self.event_log.setReadOnly(True)
-        self.event_log.setMaximumHeight(88)
-        box.addWidget(self.event_log)
+
         return page
 
     def enable_control(self):
@@ -801,7 +820,8 @@ class Window(W.QMainWindow):
         page = W.QWidget()
         box = W.QVBoxLayout(page)
         row = layout_row(self.button("Refresh", "Refresh", self.refresh_history), self.button("Open files", "Open files", self.open_history),
-                         self.button("Import package", "Import package", self.import_history))
+                         self.button("Import package", "Import package", self.import_history),
+                         self.button("Pump injection", "Pump injection", self.show_history_pump))
         row.addStretch()
         self.align = W.QComboBox()
         self.align.addItems(["Elapsed time", "Absolute time"])
@@ -815,14 +835,15 @@ class Window(W.QMainWindow):
         self.history_list.setMaximumHeight(120)
         box.addWidget(self.history_list)
         row = W.QHBoxLayout()
-        self.range_start = line_number("Start min (optional)")
-        self.range_end = line_number("End min (optional)")
+        self.range_start = line_number("Start min (optional)", width=140)
+        self.range_end = line_number("End min (optional)", width=140)
         row.addWidget(self.range_start.container)
         row.addWidget(self.range_end.container)
         for edit in (self.range_start, self.range_end):
             self.watch_number(edit, self.history_range)
         row.addWidget(self.button("Export CSV / JSON", "Export CSV / JSON", lambda: self.export_history(False)))
         row.addWidget(self.button("Export packages", "Export packages", lambda: self.export_history(True)))
+        row.addWidget(self.button("Export full report", "Export full report", self.export_full_reports))
         row.addWidget(self.button("Export PNG / SVG", "Export PNG / SVG", lambda: self.export_plots(self.history_plots)))
         box.addLayout(row)
         plots = W.QHBoxLayout()
@@ -872,6 +893,8 @@ class Window(W.QMainWindow):
         def read():
             return [(storage.summary(path), [storage.series(path, k, field, start*60, end*60 if end is not None else None) for k in ("ph", "ec")], storage.recent_events(path, 20)) for path in paths]
         self.submit(read, lambda data: self.draw_history(data, absolute))
+        if self.history_popup:
+            self.load_history_pump(paths, start, end, absolute)
 
     def history_range(self, submit=False):
         edits = {"start": self.range_start, "end": self.range_end}
@@ -895,6 +918,7 @@ class Window(W.QMainWindow):
             plot.clear()
             plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
             plot.setLabel("bottom", "Time (local)" if absolute else "Elapsed time (min)")
+            plot.getAxis("bottom").enableAutoSIPrefix(False)
         colors = ["#167cb5", "#13a192", "#a85eb3", "#da8438", "#cc506d", "#6c8d34"]
         details = []
         for i, (meta, series, events) in enumerate(data):
@@ -938,6 +962,119 @@ class Window(W.QMainWindow):
             pg.exporters.SVGExporter(plot.plotItem).export(str(path/f"plot_{i}.svg"))
         self.export_finished(str(path))
 
+    def show_history_pump(self):
+        paths = self.selected_history()
+        start, end = self.history_range(submit=True)
+        if not self.history_popup:
+            dialog = W.QDialog(self)
+            dialog.setWindowTitle("Historical pump injection comparison")
+            dialog.resize(1100, 720)
+            dialog.setAttribute(C.Qt.WidgetAttribute.WA_DeleteOnClose)
+            box = W.QVBoxLayout(dialog)
+            self.history_pump_note = W.QLabel()
+            self.history_pump_note.setWordWrap(True)
+            box.addWidget(self.history_pump_note)
+            self.history_pump_plot = self.make_plot("Pump injection comparison", "Cumulative injection (mL)")
+            box.addWidget(self.history_pump_plot, 1)
+            box.addLayout(layout_row(
+                self.button("Export PNG / SVG", "Export PNG / SVG", lambda: self.export_plots([self.history_pump_plot])),
+                self.button("Export pump CSV", "Export pump CSV", self.export_history_pump_csv)))
+            dialog.destroyed.connect(self.history_pump_closed)
+            self.history_popup = dialog
+            dialog.show()
+        self.history_popup.raise_()
+        self.load_history_pump(paths, start, end, self.align.currentIndex() == 1)
+
+    def history_pump_closed(self):
+        self.history_popup = None
+        self.history_generation += 1
+
+    def load_history_pump(self, paths, start, end, absolute):
+        self.history_generation += 1
+        generation = self.history_generation
+        self.history_pump_paths = list(paths)
+        self.history_pump_note.setText("Loading historical records…")
+        def draw(data):
+            if not self.history_popup or generation != self.history_generation:
+                return
+            plot = self.history_pump_plot
+            plot.clear()
+            plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
+            plot.setLabel("bottom", "Time (local)" if absolute else "Elapsed time (min)")
+            plot.getAxis("bottom").enableAutoSIPrefix(False)
+            notes = []
+            for i, entry in enumerate(data):
+                name = Path(entry["meta"]["path"]).stem
+                color = pg.intColor(i, hues=max(6, len(data)), values=1, maxValue=170)
+                charts.draw_pump(plot, entry, color, name, absolute)
+                notes.append(f"{name}: {entry['count']} injections, {entry['estimates']} estimated, {entry['unknown']} unknown")
+            self.history_pump_note.setText("\n".join(notes))
+            plot.enableAutoRange()
+        self.submit(lambda: [reporting.pump_series(p, start*60, end*60 if end is not None else None) for p in paths], draw)
+
+    def export_history_pump_csv(self):
+        paths = list(self.history_pump_paths)
+        destination = self.root/"exports"/datetime.now().strftime("Export_%Y-%m-%d_%H-%M-%S")
+        def export():
+            for path in paths:
+                folder, meta = reporting.output_directory(path, destination)
+                reporting.export_pump_csv(path, folder/f"{reporting.safe_name(meta.get('name', Path(path).stem))}_pump injection.csv")
+            return str(destination)
+        self.submit(export, self.export_finished)
+
+    def export_full_reports(self):
+        for path in self.selected_history():
+            self.queue_bundle(path)
+
+    def queue_bundle(self, path, pump_only=False):
+        request = (str(path), pump_only)
+        if request == self.bundle_active or request in self.bundle_queue:
+            return
+        self.bundle_queue.append(request)
+        self.next_bundle()
+
+    def next_bundle(self):
+        if self.bundle_active or not self.bundle_queue:
+            return
+        self.bundle_active = self.bundle_queue.popleft()
+        path, pump_only = self.bundle_active
+        self.notice_text = "正在导出 / Exporting: "+Path(path).name
+        self.submit(lambda: reporting.prepare_bundle(path, self.root/"exports", pump_only),
+                    self.render_bundle, self.bundle_failed)
+
+    def render_bundle(self, bundle):
+        pending = deque(bundle["charts"])
+        def render_next():
+            try:
+                if pending:
+                    charts.render_report(pending.popleft())
+                    C.QTimer.singleShot(0, render_next)
+                    return
+                request = self.bundle_active
+                if request in self.failed_exports:
+                    self.failed_exports.remove(request)
+                self.retry_export_button.setVisible(bool(self.failed_exports))
+                self.notice_text = "已导出 / Exported: "+bundle["folder"]
+                self.bundle_active = None
+                self.next_bundle()
+            except Exception as exc:
+                self.bundle_failed(str(exc))
+        C.QTimer.singleShot(0, render_next)
+
+    def bundle_failed(self, error):
+        if self.bundle_active and self.bundle_active not in self.failed_exports:
+            self.failed_exports.append(self.bundle_active)
+        self.bundle_active = None
+        self.retry_export_button.setVisible(bool(self.failed_exports))
+        self.notice_text = "导出失败 / Export failed: "+error
+        self.footer.setText(self.notice_text)
+        W.QMessageBox.warning(self, "Export failed", self.notice_text+"\n可重试或在数据管理页重新导出。 / Retry or use Export full report.")
+        self.next_bundle()
+
+    def retry_exports(self):
+        for request in list(self.failed_exports):
+            self.queue_bundle(*request)
+
     def show_pump(self):
         if self.popup:
             self.popup.raise_()
@@ -963,7 +1100,7 @@ class Window(W.QMainWindow):
 
     def query_charts(self, snap):
         path = snap.get("path")
-        pump_path = path or snap.get("test_path")
+        pump_path = path or (snap.get("last_completed") or {}).get("path") or snap.get("test_path")
         if not path and not (self.popup and pump_path):
             return
         self.chart_busy = True
@@ -972,8 +1109,8 @@ class Window(W.QMainWindow):
         show_pump = self.popup is not None
         def read():
             curves = {kind: {field: storage.series(path, kind, field, start) for field in ("raw", "filtered")} for kind in ("ph", "ec")} if path else {}
-            injections = storage.injection_series(pump_path) if show_pump and pump_path else []
-            events = storage.refill_events(pump_path) if show_pump and pump_path else []
+            injections = reporting.pump_series(pump_path, end=snap["elapsed"] if path else None) if show_pump and pump_path else None
+            events = []
             return path, curves, injections, events
         self.submit(read, self.draw_charts)
 
@@ -989,19 +1126,10 @@ class Window(W.QMainWindow):
                 values = [hydroxide(r[1], r[2]) if oh and kind == "ph" else r[1] for r in rows]
                 self.live_curves[kind][field].setData([r[0]/60 for r in rows], values, connect="finite")
                 self.live_curves[kind][field].setVisible(self.raw_check.isChecked() if field == "raw" else self.processed_check.isChecked())
-        if self.popup:
-            formal = bool(self.runtime.snapshot.get("path"))
-            rows = [r for r in injections if (r[3] == "experiment") == formal]
-            values = [r[1] for r in rows]
-            self.pump_curve.setData([0.]+[r[0]/60 for r in rows], [0.]+values, stepMode="left")
-            for line in self.refill_lines:
-                self.pump_plot.removeItem(line)
-            self.refill_lines = []
-            for event in events:
-                if event["kind"] == "refill":
-                    line = pg.InfiniteLine(event["t"]/60, angle=90, pen=pg.mkPen("#d49224", style=C.Qt.PenStyle.DashLine), label="Refill")
-                    self.pump_plot.addItem(line)
-                    self.refill_lines.append(line)
+        if self.popup and injections:
+            self.pump_plot.clear()
+            charts.draw_pump(self.pump_plot, injections)
+
 
     def refresh(self):
         s = self.runtime.snapshot
@@ -1019,11 +1147,13 @@ class Window(W.QMainWindow):
             identity.setText("Device identity: "+str(bound.get("identity", "—")))
             connect.setEnabled(not bound and not s["scan_busy"])
             disconnect.setEnabled(bool(bound))
-        self.start_button.setEnabled(not s["recording"])
-        self.finish_button.setEnabled(s["recording"])
-        self.enable_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"])
+        self.start_button.setEnabled(not s["recording"] and not s.get("finishing") and not self.bundle_active and not self.bundle_queue)
+        self.finish_button.setEnabled(s["recording"] and not s.get("finishing"))
+        self.enable_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"] and not s.get("finishing"))
         self.pause_button.setEnabled(s["enabled"] or bool(s["active"]))
-        self.filename.setText(Path(s["path"]).name if s["path"] else "—")
+        completed = s.get("last_completed") or {}
+        shown_path = s["path"] or completed.get("path")
+        self.filename.setText(Path(shown_path).name if shown_path else "—")
         phase = s["phase"] if s["active"] and s["phase"] != "idle" else s["state"]
         status = STATE_ZH.get(phase, phase) if zh else phase.replace("_", " ")
         detail = (f"{status}  ·  目标 {fmt(s['target'])}  ·  混合剩余 {s['mix_remaining']:.1f} s  ·  设置 v{s['settings']['version']}" if zh else
@@ -1045,9 +1175,11 @@ class Window(W.QMainWindow):
                                 (("就绪，可独立测试" if zh else "Ready for independent test") if "" in test_errors else
                                  ("请检查测试参数：" if zh else "Check test parameters: ")+test_errors[0]))
         latest = s.get("last_failure") or s.get("last_results", {}).get("experiment")
-        self.dose_result_label.setText(dose_result_text(latest, zh))
+        self.dose_result_label.setText(dose_result_text(latest, zh).split("\n")[0])
         self.dose_result_label.setVisible(bool(latest))
         self.dose_result_label.setStyleSheet("color: #b83645;" if s.get("last_failure") else "")
+        if s.get("last_failure"):
+            self.monitor_status.setText(self.monitor_status.text()+" · "+latest["result"].get("error", ""))
         h = s["hardware"]
         self.hardware_text.setPlainText((f"注射器容量：{fmt(h.get('capacity_ml'))} mL\n有效面积：{fmt(h.get('area_mm2'))} mm²\n仪器推力：{fmt(h.get('force_percent'),0)} %\n注射器型号与校准历史：仪器未提供，可在实验设置中添加备注。" if zh else
                                         f"Syringe capacity: {fmt(h.get('capacity_ml'))} mL\nEffective area: {fmt(h.get('area_mm2'))} mm²\nInstrument force: {fmt(h.get('force_percent'),0)} %\nSyringe model and calibration history are not provided. Add a note in Settings."))
@@ -1063,8 +1195,14 @@ class Window(W.QMainWindow):
         self.cards["temp"].setText(fmt(temp, 2))
         self.cards["used"].setText(fmt(s["load"]["used_ml"]))
         self.cards["remaining"].setText(fmt(s["remaining"]))
-        motion = {1: ("运行", "Running"), 2: ("暂停", "Paused"), 3: ("停止", "Stopped")}.get(s["pump"].get("state"), ("未知", "Unknown"))
-        self.cards["pump"].setText(motion[0 if zh else 1] if s["connections"].get("pump", {}).get("connected") else "—")
+        charge = s.get("charge", {})
+        q = charge.get("coulombs", 0.)
+        scaled = abs(q) >= 1000
+        self.cards["charge"].setText(fmt(q/1000 if scaled else q, 3) if charge.get("available") else "—")
+        partial = (" · 部分时段估算" if zh else " · Partial coverage") if charge.get("partial") else ""
+        self.charge_unit.setText((("kC" if scaled else "C")+partial) if charge.get("available") else "")
+        self.cards["charge"].setToolTip("Charge estimate unavailable: calculation overflow." if charge.get("overflow") else
+                                       "Q = Σ I × Δt; manual current, recording time; pump pauses do not pause charge.")
         if s["load"]["uncertain"]:
             self.cards["used"].setText("? "+fmt(s["load"]["used_ml"]))
             self.cards["remaining"].setText("?")
@@ -1107,10 +1245,6 @@ class Window(W.QMainWindow):
                 line.setVisible(value is not None and not (i == 0 and self.ph_axis.currentIndex()))
                 if value is not None:
                     line.setValue(value)
-        text = "\n".join(f"{n['time'][11:19]}  {n['kind']}  {json.dumps(n['data'], ensure_ascii=False)[:350]}" for n in s["notices"][-8:])
-        if self.event_log.toPlainText() != text:
-            self.event_log.setPlainText(text)
-            self.event_log.verticalScrollBar().setValue(self.event_log.verticalScrollBar().maximum())
         resulttext = dose_result_text(s.get("last_results", {}).get("test"), zh)
         if self.test_results.toPlainText() != resulttext:
             self.test_results.setPlainText(resulttext)
@@ -1119,9 +1253,16 @@ class Window(W.QMainWindow):
             self.last_error = errors[-1]["time"]
             self.notice_text = errors[-1]["data"].get("error", "")
         self.footer.setText(s["storage_error"] or self.notice_text or detail)
+        pending_export = s.get("export_pending")
+        if pending_export:
+            if pending_export["path"] not in self.export_seen:
+                self.export_seen.append(pending_export["path"])
+                self.queue_bundle(pending_export["path"])
+            self.runtime.command("export_ack", path=pending_export["path"])
         if self.popup:
             self.pump_detail.setText(f"{s['phase']}  ·  Device counter: {fmt(s['pump'].get('counter_ml'))} mL  ·  Experiment total: {fmt(s['cumulative_ml'])} mL\n"
-                                    f"Live estimate (not final accounting): {fmt(s['progress'].get('estimate_ml'))} mL  ·  {s['pending_reason']}")
+                                    f"Pump state: {s['pump'].get('state', '—')}  ·  Live estimate: {fmt(s['progress'].get('estimate_ml'))} mL  ·  {s['pending_reason']}\n"+
+                                    dose_result_text(latest or s.get("last_results", {}).get("test"), zh))
         if self.navigation.currentRow() == 4 and self.last_path != s["path"]:
             self.refresh_history()
             self.last_path = s["path"]
@@ -1130,6 +1271,16 @@ class Window(W.QMainWindow):
             self.query_charts(s)
 
     def closeEvent(self, event):
+        with self.runtime.commands.mutex:
+            start_queued = any(command[0] == "start_recording" for command in self.runtime.commands.queue)
+        if self.runtime.thread.is_alive() and (self.runtime.engine.recording or self.runtime.finish_pending or start_queued):
+            event.ignore()
+            W.QMessageBox.information(self, "Experiment recording", "请先点击“结束实验”，等待保存完成后再关闭。\nEnd the experiment and wait for saving before closing.")
+            return
+        if self.bundle_active or self.bundle_queue:
+            event.ignore()
+            W.QMessageBox.information(self, "Export in progress", "正在导出，请等待完成。\nPlease wait for the export to finish.")
+            return
         if not self.closing:
             self.closing = True
             self.runtime.close()

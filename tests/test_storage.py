@@ -18,7 +18,7 @@ def test_store_roundtrip_extrema_and_exports(tmp_path):
     export_data(s.path, tmp_path/"export")
     export_package(s.path, tmp_path/"test.em2zip")
     imported = import_package(tmp_path/"test.em2zip", tmp_path)
-    assert summary(imported)["duration"] == 999
+    assert summary(imported)["duration"] == 1000  # Includes the final event.
     s.close()
     assert summary(s.path)["status"] == "completed"
     assert (tmp_path/"export/samples.csv").exists()
