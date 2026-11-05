@@ -16,6 +16,7 @@ class Engine:
         self.pending_settings = None
         self.recording = False
         self.enabled = False
+        self.feedback_not_before = None
         self.connected = {"ph": False, "ec": False, "pump": False}
         self.hardware_ready = False
         self.active: Dose | None = None
@@ -71,6 +72,8 @@ class Engine:
     def observe(self, sample: Sample):
         if not sample.valid or not sample.live:
             return None
+        if self.enabled and self.feedback_not_before is not None and sample.mono <= self.feedback_not_before:
+            return None
         if sample.sequence <= self.last_sequence.get(sample.kind, -1):
             return None
         self.last_sequence[sample.kind] = sample.sequence
@@ -102,18 +105,24 @@ class Engine:
                 self.emit("alarm_recovered", {"signal": sample.kind, "raw": x})
         return y
 
-    def enable(self):
+    def validate_enable(self):
         if not self.recording:
             raise ValueError("Start recording first")
         if self.active:
             raise ValueError("Wait for the pump to stop")
-        self.settings.validate(complete=True)
+        Settings.from_dict(self.settings.payload()).validate(complete=True)
         if self.storage_failed:
             raise ValueError("Data storage is unavailable")
         if not self.connected["pump"] or not self.hardware_ready:
             raise ValueError("Pump stop and configuration must be confirmed")
         if not self.load.allows(self.settings.dose_ml):
             raise ValueError("Insufficient or unverified load allowance")
+
+    def enable(self, *, not_before=None):
+        self.validate_enable()
+        self.feedback_not_before = not_before
+        if not_before is not None:
+            self.ready_at = max(self.ready_at, not_before)
         self.enabled = True
         self.manual_reason = ""
         self.alarm = False

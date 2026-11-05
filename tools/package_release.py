@@ -44,11 +44,11 @@ def main():
                 'packaged_utc': datetime.now(timezone.utc).isoformat(),
                 'exe_sha256': build['files']['ElectrolyteManager.exe'],
                 'dependencies': {name: metadata.version(name) for name in ('PySide6', 'pyqtgraph', 'pyserial', 'numpy')},
-                'validation': 'See release notes and docs/VALIDATION.md. M80 hardware acceptance is read-only; other devices have software regression coverage. Earlier endurance, gravimetric and physical-fault acceptance remains incomplete.'}
+                'validation': 'See release notes and docs/VALIDATION.md. Version 3.1 countdown acceptance uses simulated clocks, pumps and sensors; no physical pumping was performed. Version 3.0 M80 read-only hardware evidence remains in its release. Earlier endurance, gravimetric and physical-fault acceptance remains incomplete.'}
     manifest_path = output/'release.json'
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     archive = output/f'ElectrolyteManager-{__version__}-Windows-x64.zip'
-    prefix = 'Electrolyte-Manager-3.0/'
+    prefix = 'Electrolyte-Manager-3.1/'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for name, path in files.items():
             z.write(path, prefix+'app/'+name)

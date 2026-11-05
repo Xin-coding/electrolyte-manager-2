@@ -21,6 +21,7 @@ from . import forms
 from .paths import atomic_json, read_json
 from .units import hydroxide
 from .chart_range import attach as attach_range
+from .countdown import confirmation_context, duration, status_text
 
 pg.setConfigOptions(antialias=True, background="white", foreground="#17324d")
 
@@ -54,6 +55,7 @@ QToolTip { background: #18324a; color: white; padding: 6px; border: none; }
 """
 
 STATE_ZH = {
+    "feedback_countdown_pending": "请先取消反馈倒计时再测试泵",
     "idle": "就绪", "recording": "正在记录", "preparing": "准备泵参数",
     "injecting": "正在注射", "confirming_stop": "确认停止与最终计量", "mixing": "等待充分混合",
     "awaiting_counter": "已停泵，等待最终计数", "accounting_review": "已停泵，最终计量需核实",
@@ -539,13 +541,13 @@ class Window(W.QMainWindow):
         box.addLayout(row)
         return page
 
-    def confirm_hardware(self, details):
+    def confirm_hardware(self, details, *, force=False):
         snap = self.runtime.snapshot
         h = snap.get("hardware", {})
         if not h:
             raise ValueError("Connect the pump first")
         signature = h.get("signature")
-        if signature == snap.get("confirmed_signature"):
+        if not force and signature == snap.get("confirmed_signature"):
             return signature
         zh = self.language == "zh"
         cfg = details.get("settings", details)
@@ -555,6 +557,9 @@ class Window(W.QMainWindow):
                  if zh else f"Effective settings:\nVolume: {cfg.get('dose_ml',cfg.get('volume_ml'))} mL\nFlow: {cfg.get('flow_ml_min')} mL/min\nForce: {cfg.get('force_percent')} %\nMixing: {cfg.get('mix_s',0)} s"))
         if details.get("hardware_cap_ml"):
             text += f"\nHardware cap: {details['hardware_cap_ml']} mL"
+        if details.get("delay_s"):
+            text += (f"\n\n确认后开始倒计时：{duration(details['delay_s'])}\n到时复核后启用反馈，不再弹窗。" if zh else
+                     f"\n\nDelay after confirmation: {duration(details['delay_s'])}\nFeedback starts after final checks; no further dialog.")
         if cfg.get("metadata",{}).get("syringe_note"):
             text += "\n\n"+cfg["metadata"]["syringe_note"]
         title = "确认注射器与本次设置" if self.language == "zh" else "Confirm syringe and effective settings"
@@ -781,6 +786,29 @@ class Window(W.QMainWindow):
         for b in (self.start_button, self.enable_button, self.pause_button, self.finish_button):
             row.addWidget(b)
         box.addLayout(row)
+        delay_row = W.QHBoxLayout()
+        delay_row.addWidget(self.label("反馈启动倒计时", "Delay feedback start"))
+        self.delay_hours = W.QSpinBox()
+        self.delay_hours.setRange(0, 999)
+        self.delay_hours.setMinimumWidth(85)
+        self.delay_minutes = W.QSpinBox()
+        self.delay_minutes.setRange(0, 59)
+        self.delay_minutes.setValue(1)
+        self.delay_minutes.setMinimumWidth(70)
+        delay_row.addWidget(self.delay_hours)
+        delay_row.addWidget(self.label("小时", "h"))
+        delay_row.addWidget(self.delay_minutes)
+        delay_row.addWidget(self.label("分钟", "min"))
+        self.schedule_button = self.button("启用倒计时", "Start countdown", self.schedule_control)
+        self.cancel_schedule_button = self.button("取消倒计时", "Cancel countdown", self.cancel_schedule)
+        delay_row.addWidget(self.schedule_button)
+        delay_row.addWidget(self.cancel_schedule_button)
+        delay_row.addStretch()
+        box.addLayout(delay_row)
+        self.countdown_status = W.QLabel()
+        self.countdown_status.setWordWrap(True)
+        self.countdown_status.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(self.countdown_status)
         self.filename = W.QLabel("—")
         self.filename.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
         box.addWidget(self.filename)
@@ -870,7 +898,24 @@ class Window(W.QMainWindow):
         self.ph_plot.range_control.set_axis(1, False)
         self.invalidate_charts()
 
+    def cancel_schedule(self):
+        self.runtime.command("cancel_countdown", reservation_id=self.runtime.snapshot.get("countdown", {}).get("id"))
+
+    def schedule_control(self):
+        seconds = self.delay_hours.value()*3600+self.delay_minutes.value()*60
+        if seconds < 60:
+            raise ValueError("倒计时至少 1 分钟" if self.language == "zh" else "Countdown must be at least 1 minute")
+        snap = self.runtime.snapshot
+        Settings.from_dict(snap["settings"]).validate(complete=True)
+        context = confirmation_context(snap["settings"], snap["hardware"], snap["bindings"], snap["load"])
+        sig = self.confirm_hardware({"settings": snap["settings"], "delay_s": seconds}, force=True)
+        if sig:
+            self.runtime.command("schedule_feedback", delay_s=seconds, context=context, signature=sig,
+                                 _stop_generation=snap.get("command_generation", 0))
+
     def enable_control(self):
+        if self.runtime.snapshot.get("countdown", {}).get("state") == "pending":
+            self.cancel_schedule()
         settings = self.runtime.snapshot["settings"]
         try:
             Settings.from_dict(settings).validate(complete=True)
@@ -1257,7 +1302,15 @@ class Window(W.QMainWindow):
         self.start_button.setEnabled(not s["recording"] and not s.get("finishing") and not self.bundle_active and not self.bundle_queue)
         self.finish_button.setEnabled(s["recording"] and not s.get("finishing"))
         self.enable_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"] and not s.get("finishing"))
-        self.pause_button.setEnabled(s["enabled"] or bool(s["active"]))
+        countdown = s.get("countdown", {"state": "idle"})
+        scheduled = countdown["state"] == "pending"
+        self.pause_button.setEnabled(s["enabled"] or bool(s["active"]) or scheduled)
+        self.schedule_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"] and not s.get("finishing") and not scheduled)
+        self.cancel_schedule_button.setEnabled(scheduled)
+        self.delay_hours.setEnabled(not scheduled)
+        self.delay_minutes.setEnabled(not scheduled)
+        self.countdown_status.setText(status_text(countdown, zh))
+        self.countdown_status.setStyleSheet("color: #b83645;" if countdown["state"] == "failed" else "color: #0a5571;")
         completed = s.get("last_completed") or {}
         shown_path = s["path"] or completed.get("path")
         self.filename.setText(Path(shown_path).name if shown_path else "—")

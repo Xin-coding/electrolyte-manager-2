@@ -19,10 +19,11 @@ from .devices.pump import PumpWorker
 from .errors import ParameterError
 from .charge import Charge, current_value
 from .forms import parse_number
+from .countdown import confirmation_context, operational
 
 
 class Runtime:
-    def __init__(self, root=None):
+    def __init__(self, root=None, *, autostart=True, clock=None):
         self.root = root or root_dir()
         for folder in ("data", "exports", "data/profiles", "data/tests"):
             (self.root/folder).mkdir(parents=True, exist_ok=True)
@@ -32,6 +33,10 @@ class Runtime:
         self.stop_lock = threading.Lock()
         self.stop_generation = 0
         self.priority_stop = ""
+        self.clock = clock or time.monotonic
+        self.countdown = {"state": "idle"}
+        self.countdown_serial = 0
+        self.countdown_cancel = None
         self.workers = {}
         self.bindings = {}
         self.connections = {}
@@ -90,12 +95,18 @@ class Runtime:
         self.export_pending = None
         self.last_completed = None
         self.thread = threading.Thread(target=self.run, name="em2-service", daemon=True)
-        self.thread.start()
+        if autostart:
+            self.thread.start()
 
     def command(self, action, **data):
-        if action in {"test", "enable"}:
+        if action in {"cancel_countdown", "enable", "finish", "pause"}:
+            self.request_countdown_cancel(data.get("reason", action if action != "cancel_countdown" else "cancelled"),
+                                          data.get("reservation_id"))
+            if action == "cancel_countdown":
+                return
+        if action in {"test", "enable", "schedule_feedback"}:
             with self.stop_lock:
-                data["_stop_generation"] = self.stop_generation
+                data.setdefault("_stop_generation", self.stop_generation)
         self.commands.put_nowait((action, data))
 
     def stop(self, reason="emergency_stop"):
@@ -103,6 +114,7 @@ class Runtime:
         with self.stop_lock:
             self.stop_generation += 1
             self.priority_stop = reason
+            self.countdown_cancel = (reason, None)
         worker = self.workers.get("pump")
         if worker:
             worker.stop(reason)
@@ -110,8 +122,141 @@ class Runtime:
     def apply_priority_stop(self):
         with self.stop_lock:
             reason, self.priority_stop = self.priority_stop, ""
+            cancellation, self.countdown_cancel = self.countdown_cancel, None
+        if cancellation:
+            why, ident = cancellation
+            # A click from the pending view also wins a race with activation.
+            if self.countdown["state"] == "started" and ident == self.countdown.get("id"):
+                self.engine.pause(why)
+                self.countdown.update(state="cancelled", reason=why)
+                self.event("feedback_countdown_cancelled", dict(self.countdown))
+            self.cancel_countdown(why)
         if reason:
             self.engine.pause(reason)
+
+    def request_countdown_cancel(self, reason, ident=None):
+        with self.stop_lock:
+            self.stop_generation += 1
+            self.countdown_cancel = (reason, ident)
+
+    def countdown_context(self):
+        return confirmation_context(self.engine.settings.payload(), self.hardware,
+                                    {k: asdict(v) for k, v in self.bindings.items()}, asdict(self.engine.load))
+
+    def cancel_countdown(self, reason):
+        if self.countdown["state"] == "pending":
+            self.countdown.update(state="cancelled", reason=reason)
+            self.event("feedback_countdown_cancelled", dict(self.countdown))
+
+    def countdown_block_reason(self, *, due=False):
+        e = self.engine
+        if not e.recording or not self.store or self.finish_pending:
+            return "recording"
+        if e.enabled or e.active or self.result_pending:
+            return "busy"
+        if e.pending_settings or self.pending_allowance is not None:
+            return "pending"
+        if (not e.connected["pump"] or not e.hardware_ready or self.pump_status.get("state") != 3
+                or self.pump_status.get("error") or not self.hardware.get("signature")):
+            return "pump"
+        if e.storage_failed or self.local_storage_error or self.store.error or self.store.failure_age:
+            return "storage"
+        try:
+            Settings.from_dict(e.settings.payload()).validate(complete=True)
+        except ValueError:
+            return "settings"
+        if not e.load.allows(e.settings.dose_ml):
+            return "allowance"
+        # Shared validation remains the final authority for immediate/delayed enable.
+        e.validate_enable()
+        if due:
+            if not 0 <= self.clock()-self.pump_status.get("read_at", float("-inf")) <= 5:
+                return "pump"
+            kind = e.settings.control
+            sample = e.latest.get(kind)
+            shown = self.samples.get(kind, {})
+            if (not e.connected[kind] or not sample or not sample.valid or not sample.live
+                    or not shown.get("live") or shown.get("quality") != "valid"
+                    or shown.get("sequence") != sample.sequence):
+                return "signal"
+            interval = e.settings.ph_interval_s if kind == "ph" else (
+                1 if self.bindings.get("ec") and self.bindings["ec"].sensor_driver == "m80" else 60)
+            if not 0 <= self.clock()-sample.mono <= 2*interval+5:
+                return "stale"
+        return ""
+
+    def schedule_feedback(self, data):
+        seconds = data["delay_s"]
+        if type(seconds) is not int or not 60 <= seconds <= 999*3600+59*60 or seconds % 60:
+            raise ValueError("Countdown must be 1 minute to 999 hours 59 minutes")
+        if self.countdown["state"] == "pending":
+            raise ValueError("Cancel the current countdown before changing its delay")
+        reason = self.countdown_block_reason()
+        if reason:
+            raise ValueError("Cannot schedule feedback: "+reason)
+        context = self.countdown_context()
+        if data.get("context") != context or not context["signature"] or data.get("signature") != context["signature"]:
+            raise ValueError("Settings or hardware changed; confirm the countdown again")
+        self.countdown_serial += 1
+        self.countdown = {"state": "pending", "id": self.countdown_serial,
+                          "delay_s": seconds, "deadline": self.clock()+seconds,
+                          "expected_at": time.time()+seconds, "context": context,
+                          "generation": data.get("_stop_generation", self.stop_generation), "reason": ""}
+        self.event("feedback_countdown_created", dict(self.countdown))
+
+    def check_countdown(self):
+        self.apply_priority_stop()
+        c = self.countdown
+        if c["state"] != "pending":
+            return
+        if c["context"] != self.countdown_context():
+            self.cancel_countdown("changed")
+            return
+        now = self.clock()
+        if now < c["deadline"]:
+            return
+        reason = "missed" if now-c["deadline"] > 5 else self.countdown_block_reason(due=True)
+        if reason:
+            c.update(state="failed", reason=reason)
+            self.event("feedback_countdown_failed", dict(c))
+            return
+        with self.stop_lock:
+            stale = c["generation"] != self.stop_generation or bool(self.priority_stop or self.countdown_cancel)
+        if stale:
+            self.cancel_countdown("cancelled")
+            return
+        self.confirmed_signature = c["context"]["signature"]
+        try:
+            self.engine.enable(not_before=now)
+        except Exception as exc:
+            self.engine.enabled = False
+            c.update(state="failed", reason="settings", error=str(exc))
+            self.event("feedback_countdown_failed", dict(c))
+            return
+        if self.clock()-c["deadline"] > 5:
+            self.engine.pause("countdown_missed")
+            c.update(state="failed", reason="missed")
+            self.event("feedback_countdown_failed", dict(c))
+            return
+        self.engine.feedback_not_before = self.clock()
+        # No storage/GUI callback runs while holding the emergency-stop lock.
+        with self.stop_lock:
+            stale = c["generation"] != self.stop_generation or bool(self.priority_stop or self.countdown_cancel)
+            if not stale:
+                c["state"] = "started"
+        if stale:
+            self.engine.pause("countdown_cancelled")
+            self.apply_priority_stop()
+            self.cancel_countdown("cancelled")
+            return
+        self.event("feedback_countdown_started", dict(c))
+
+    def countdown_snapshot(self):
+        c = dict(self.countdown)
+        c["remaining_s"] = max(0., c.get("deadline", self.clock())-self.clock()) if c["state"] == "pending" else 0.
+        if c["state"] == "pending":
+            c["expected_at"] = time.time()+c["remaining_s"]
+        return c
 
     def emit(self, name, data):
         try:
@@ -223,7 +368,7 @@ class Runtime:
         try:
             d = request["dose"]
             e = self.engine
-            if not e.active or e.active.id != d.id or e.stop_requested or e.storage_failed or self.priority_stop or self.result_pending:
+            if not e.active or e.active.id != d.id or e.stop_requested or e.storage_failed or self.priority_stop or self.countdown_cancel or self.result_pending:
                 return
             if d.purpose == "experiment" and (not e.enabled or e.alarm or not e.connected[e.settings.control]):
                 return
@@ -367,6 +512,7 @@ class Runtime:
             old = self.hardware.get("signature")
             self.hardware = data
             if old and old != data["signature"]:
+                self.cancel_countdown("changed")
                 self.confirmed_signature = None
                 e.pause("hardware_changed", interrupt=False)
                 self.event("hardware_changed", data)
@@ -409,14 +555,16 @@ class Runtime:
 
     def dispatch(self, name, data):
         e = self.engine
-        if self.finish_pending and name in {"start_recording", "enable", "test", "apply", "allowance"}:
+        if self.finish_pending and name in {"start_recording", "enable", "test", "apply", "allowance", "schedule_feedback"}:
             raise ValueError("Wait for experiment finalization")
-        if name in {"test", "enable"}:
-            generation = data.pop("_stop_generation", self.stop_generation)
+        if name in {"test", "enable", "schedule_feedback"}:
+            generation = data.get("_stop_generation", self.stop_generation)
+            if name != "schedule_feedback":
+                data.pop("_stop_generation", None)
             if generation != self.stop_generation or self.priority_stop:
                 self.event("command_cancelled", {"command": name, "reason": "superseded_by_stop"})
                 return
-        if self.result_pending and name in {"test", "enable", "allowance", "start_recording"}:
+        if self.result_pending and name in {"test", "enable", "allowance", "start_recording", "schedule_feedback"}:
             raise ValueError("Wait for the final injection result to be saved")
         if name == "scan":
             self.scan()
@@ -440,6 +588,7 @@ class Runtime:
                 raise ValueError("Wait for the completed experiment export to be queued")
             new_store = Store.create(self.root/"data", data.get("name", "Experiment"), e.settings.payload())
             e.begin()
+            self.countdown = {"state": "idle"}
             self.epoch = time.monotonic()
             self.charge.begin(self.epoch, current_value(e.settings.metadata))
             self.finish_context = None
@@ -449,10 +598,12 @@ class Runtime:
             self.store.event(0, "recording_started", {"bindings": {k: asdict(v) for k, v in self.bindings.items()}, "load": asdict(e.load)})
             keep_awake(True)
         elif name == "finish":
+            self.cancel_countdown("finish")
             if self.store and not self.finish_pending:
                 e.pause("ending")
                 self.finish_pending = True
         elif name == "enable":
+            self.cancel_countdown("enable")
             if self.local_storage_error:
                 self.persist_ledger()
                 e.storage_failed = any(s.failure_age >= 30 for s in (self.store,self.bench) if s)
@@ -461,7 +612,10 @@ class Runtime:
             self.confirmed_signature = data["signature"]
             e.enable()
         elif name == "pause":
+            self.cancel_countdown("manual_pause")
             e.pause(data.get("reason", "manual_pause"))
+        elif name == "schedule_feedback":
+            self.schedule_feedback(data)
         elif name == "apply":
             if self.finish_pending:
                 raise ValueError("Wait for experiment finalization")
@@ -470,6 +624,9 @@ class Runtime:
             value, issue = parse_number(str(raw_current if raw_current is not None else ""))
             if issue:
                 raise ValueError("Current (A): "+issue[1])
+            if (operational(settings.payload()) != operational(e.settings.payload()) or
+                    settings.metadata.get("syringe_note", "") != e.settings.metadata.get("syringe_note", "")):
+                self.cancel_countdown("changed")
             previous = current_value(e.settings.metadata)
             now = time.monotonic()
             e.apply(settings, now)
@@ -487,6 +644,7 @@ class Runtime:
                 raise ValueError("Review the unresolved dose or refill the syringe")
             if not finite(data["value"]) or data["value"] <= 0:
                 raise ValueError("Load allowance must be positive")
+            self.cancel_countdown("changed")
             if not data.get("refill") and (e.active or time.monotonic() < e.ready_at):
                 self.pending_allowance = data["value"]
                 self.event("allowance_requested", {"old": e.load.limit_ml, "new": data["value"]})
@@ -498,6 +656,8 @@ class Runtime:
                 self.pending_reason = ""
                 self.persist_ledger()
         elif name == "test":
+            if self.countdown["state"] == "pending":
+                raise ValueError("Cancel the feedback countdown before testing the pump")
             if data.pop("signature", None) != self.hardware.get("signature"):
                 raise ValueError("Confirm the current syringe information")
             self.confirmed_signature = self.hardware["signature"]
@@ -525,6 +685,8 @@ class Runtime:
             raise ValueError("Unsupported application command")
 
     def test_block_reason(self, cap=None):
+        if self.countdown["state"] == "pending":
+            return "feedback_countdown_pending"
         if self.pump_status.get("error"):
             return "pump_fault"
         return self.engine.test_block_reason(cap)
@@ -545,6 +707,8 @@ class Runtime:
             "cumulative_ml": e.cumulative_ml, "elapsed": self.elapsed() if self.store else 0,
             "notices": list(self.notices)[-30:], "scan_busy": self.scan_busy,
             "ec_choice": self.ec_choice,
+            "countdown": self.countdown_snapshot(),
+            "command_generation": self.stop_generation,
             "pending_reason": self.pending_reason, "storage_error": self.local_storage_error or (self.store.error if self.store else ""),
             "pending_allowance": self.pending_allowance,
             "test_block_reason": self.test_block_reason(),
@@ -581,6 +745,8 @@ class Runtime:
                     if self.pending_allowance is not None and not e.active and time.monotonic() >= e.ready_at:
                         e.set_allowance(self.pending_allowance)
                         self.pending_allowance = None
+                    self.check_countdown()
+                    self.apply_priority_stop()
                     d = e.tick(time.monotonic())
                     if d:
                         try:

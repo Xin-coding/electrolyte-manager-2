@@ -1,4 +1,14 @@
-# Validation status — 3.0.0
+# Validation status — 3.1.0
+
+
+## Version 3.1.0 automated acceptance (2026-11-05)
+
+- **275 automated tests passed**, including all 216 previous tests and 59 countdown tests. The 58 warnings are existing pyqtgraph default-parameter deprecations. Physical serial access is blocked in the test suite.
+- Simulated monotonic clocks verify a six-hour delay, maximum duration, one-shot activation, wall-clock changes, deadline grace (5 seconds), suspension during activation, and no restore after restart. Cancellation is tested before, during and immediately after activation, including cancellation from a second thread and stale command generations.
+- Simulated sensor/pump state verifies pump disconnection/fault/stale status, invalid and buffered readings, exact freshness boundaries for M80/PC8500/pH, allowance and storage failures, parameter changes, refill, identity changes, ordinary notes/current changes, retained automatic targets and the requirement for a new post-activation reading.
+- The existing syringe dialog is forced at scheduling even if the syringe was previously confirmed. Cancelling it creates no reservation. The deadline path has no UI callback or second dialog. Recording, charge accumulation and database event evidence are covered while feedback remains off.
+- **24 interface views** cover Chinese/English, 100%/125%/150% scale, 1420×930 and 1100×760 logical windows, pending and persistent-failure states. Countdown controls and status were inspected in the generated screenshots.
+- This release performs **no physical pump dosing or new device hardware acceptance**. M80 read-only hardware evidence below belongs to 3.0. The Windows portable build and public-download verification are documented in the release delivery report.
 
 ## Version 3.0.0 acceptance (2026-11-05)
 
