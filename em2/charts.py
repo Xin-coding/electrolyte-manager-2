@@ -49,6 +49,36 @@ def save_png(plot, target):
             os.unlink(temporary)
 
 
+def save_svg(plot, target):
+    """Preserve Qt's closed paths through pyqtgraph's coordinate converter.
+
+    Qt emits an explicit closing Z for plot backgrounds. The current
+    pyqtgraph converter assumes every token is an x,y pair. Temporarily
+    detach the closing command, transform the vertices, then restore it.
+    This runs synchronously on the GUI thread, like the other exporters.
+    """
+    import importlib
+    exporter = importlib.import_module("pyqtgraph.exporters.SVGExporter")
+    original = exporter.correctCoordinates
+    def closed_coordinates(node, *args, **kwargs):
+        closed = []
+        for path in node.getElementsByTagName("path"):
+            value = path.getAttribute("d").strip()
+            if value.endswith(("Z", "z")):
+                path.setAttribute("d", value[:-1].rstrip())
+                closed.append(path)
+        try:
+            return original(node, *args, **kwargs)
+        finally:
+            for path in closed:
+                path.setAttribute("d", path.getAttribute("d").rstrip()+" Z")
+    exporter.correctCoordinates = closed_coordinates
+    try:
+        exporter.SVGExporter(plot.plotItem).export(str(target))
+    finally:
+        exporter.correctCoordinates = original
+
+
 def render_report(chart):
     """Render an independent full-experiment chart, never the live viewport."""
     if QtCore.QThread.currentThread() != QtWidgets.QApplication.instance().thread():

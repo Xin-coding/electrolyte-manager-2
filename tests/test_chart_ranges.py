@@ -134,3 +134,30 @@ def test_font_model_labels_and_empty_constant_autorange(window):
         app.processEvents(); time.sleep(.01)
     w.refresh()
     assert not w.ec_model.isEnabled() and not w.ec_address.isEnabled()
+
+
+def test_manual_view_export_with_empty_peer_and_hidden_raw(window, monkeypatch):
+    from xml.etree import ElementTree
+    import importlib
+    w, runtime, app = window
+    w.navigation.setCurrentRow(3)
+    w.live_curves["ec"]["filtered"].setData([0, 1, 2], [.5, .6, .7])
+    for kind in ("ph", "ec"):
+        w.live_curves[kind]["raw"].hide()
+    w.ec_plot.range_control.set_axis(0, True, (.25, 1.25))
+    w.ec_plot.range_control.set_axis(1, True, (.4, .8))
+    app.processEvents()
+    monkeypatch.setattr(w, "export_finished", lambda _: None)
+    exporter = importlib.import_module("pyqtgraph.exporters.SVGExporter")
+    converter = exporter.correctCoordinates
+    before = w.ec_plot.viewRange()
+    w.export_plots([w.ph_plot, w.ec_plot])
+    assert exporter.correctCoordinates is converter
+    assert w.ec_plot.viewRange() == before
+    assert len(list((runtime.root/"exports").rglob("*.png"))) == 2
+    svg = list((runtime.root/"exports").rglob("*.svg"))
+    assert len(svg) == 2
+    for path in svg:
+        root = ElementTree.parse(path).getroot()
+        assert root.tag.endswith("svg")
+        assert path.stat().st_size > 1000

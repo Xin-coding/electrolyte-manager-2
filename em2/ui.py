@@ -1031,7 +1031,7 @@ class Window(W.QMainWindow):
             exporter = pg.exporters.ImageExporter(plot.plotItem)
             exporter.parameters()["width"] = 1800
             exporter.export(str(path/f"plot_{i}.png"))
-            pg.exporters.SVGExporter(plot.plotItem).export(str(path/f"plot_{i}.svg"))
+            charts.save_svg(plot, path/f"plot_{i}.svg")
         self.export_finished(str(path))
 
     def show_history_pump(self):
