@@ -1,6 +1,8 @@
 # Electrolyte Manager 2.0
 
-Current version: **2.1.0**. Historical pump curves can be compared and exported. Ending a recording generates three PNG charts and three full-data CSVs. The monitor adds charge estimated from declared current, expands plots, and scales signal axes independently of reference lines. Recording must be ended before closing. Existing pump protocols and execution logic are unchanged. See [2.1 changes](docs/CHANGES_2_1_0.md).
+Current version: **2.1.1** (local communication repair). Metrohm HWs connections support both CTS and DSR cable readiness signals, with the selected hardware flow control shown on the Connections page. Detection tries Metrohm at 9600 first to avoid sending other protocols at incompatible baud rates to an identifiable 781. See [communication repair](docs/CHANGES_2_1_1.md).
+
+Historical pump curves can be compared and exported. Ending a recording generates three PNG charts and three full-data CSVs. The monitor adds charge estimated from declared current, expands plots, and scales signal axes independently of reference lines. Recording must be ended before closing. Existing pump protocols and execution logic are unchanged. See [2.1 changes](docs/CHANGES_2_1_0.md).
 
 Independent Windows acquisition and syringe-pump feedback software for Metrohm 781, Apera PC8500 and Longer ASP. This is a fresh Python / PySide6 application; the previous application is not its code baseline. Hardware protocols and observed firmware behavior were used as references.
 

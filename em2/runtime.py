@@ -258,7 +258,9 @@ class Runtime:
             return
         self.scan_busy = True
         used = {b.port for b in self.bindings.values()}
-        missing = [k for k in ("pump", "ec", "ph") if k not in self.workers]
+        # Identify the 9600-baud Metrohm before sending other protocols at
+        # 19200/115200, which can leave the meter displaying RS error 38.
+        missing = [k for k in ("ph", "ec", "pump") if k not in self.workers]
         def work():
             found = []
             try:

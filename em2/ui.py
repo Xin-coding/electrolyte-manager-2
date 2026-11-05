@@ -1142,7 +1142,9 @@ class Window(W.QMainWindow):
             connected = info.get("connected", False)
             status = ("正常" if zh else "Connected") if connected else (("连接中" if zh else "Connecting") if info.get("connecting") else (("重连中" if zh else "Reconnecting") if bound else ("未连接" if zh else "Disconnected")))
             color = "#168a68" if connected else "#bb7c24" if bound else "#788b9a"
-            state.setText(f"●  {status}   {info.get('endpoint', bound).get('port', '')}   {info.get('error', '') if not connected else ''}")
+            connection_detail = (info.get("info", {}).get("serial_settings", "") if connected
+                                 else info.get("error", ""))
+            state.setText(f"●  {status}   {info.get('endpoint', bound).get('port', '')}   {connection_detail}")
             state.setStyleSheet(f"color: {color}; font-weight: 600;")
             identity.setText("Device identity: "+str(bound.get("identity", "—")))
             connect.setEnabled(not bound and not s["scan_busy"])

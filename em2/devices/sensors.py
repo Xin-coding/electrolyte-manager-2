@@ -40,20 +40,47 @@ class Metrohm:
     def __init__(self, port, log=lambda *_: None):
         self.port, self.log = port, log
         self.io = None
+        self.flow_control = "RTS/CTS"
 
     def open(self):
-        self.io = serial.Serial(self.port, 9600, timeout=.1, write_timeout=.5, rtscts=True)
-        firmware = self.query("&Config.Aux.Prog $Q")
-        if "5.781." not in firmware:
-            raise ValueError("Expected Metrohm 781")
-        if '"pH"' not in self.query("&Mode.Select $Q"):
-            raise ValueError("Metrohm must be in pH mode")
-        return {"model": "Metrohm 781", "firmware": firmware.strip()}
+        self.io = serial.Serial(self.port, 9600, bytesize=serial.EIGHTBITS,
+                                parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+                                timeout=.1, write_timeout=.5, rtscts=True,
+                                dsrdtr=False, xonxoff=False)
+        try:
+            # HWs announces receive readiness on the meter's DTR. Depending
+            # on the cable, that reaches the PC's CTS or DSR. Keep hardware
+            # flow control; never bypass a missing readiness signal.
+            time.sleep(.1)
+            self.flow_control = "RTS/CTS"
+            if not self.io.cts and self.io.dsr:
+                self.io.rtscts = False
+                self.io.dsrdtr = True
+                self.flow_control = "DTR/DSR"
+            self.log("serial", f"{self.port}: 9600 8N1, {self.flow_control}, "
+                     f"CTS={int(self.io.cts)}, DSR={int(self.io.dsr)}")
+            firmware = self.query("&Config.Aux.Prog $Q")
+            if "5.781." not in firmware:
+                raise ValueError("Expected Metrohm 781")
+            if '"pH"' not in self.query("&Mode.Select $Q"):
+                raise ValueError("Metrohm must be in pH mode")
+            return {"model": "Metrohm 781", "firmware": firmware.strip(),
+                    "serial_settings": f"9600 8N1 · {self.flow_control}"}
+        except Exception:
+            self.close()
+            raise
 
     def query(self, command):
         self.io.reset_input_buffer()
         self.log("tx", command)
-        self.io.write((command+"\r\n").encode("ascii"))
+        try:
+            self.io.write((command+"\r\n").encode("ascii"))
+        except serial.SerialTimeoutException as exc:
+            raise TimeoutError(
+                f"Metrohm send timeout: {self.port}, 9600 8N1, {self.flow_control}; "
+                f"CTS={int(self.io.cts)}, DSR={int(self.io.dsr)}. "
+                "Check HWs and the cable handshake wiring."
+            ) from exc
         data = bytearray()
         end = time.monotonic()+1.5
         while time.monotonic() < end:
