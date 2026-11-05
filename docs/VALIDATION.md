@@ -1,4 +1,15 @@
-# Validation status — 2.1.0
+# Validation status — 3.0.0
+
+## Version 3.0.0 acceptance (2026-11-05)
+
+- **216 automated tests passed** locally and on GitHub Windows runners. Coverage includes M80 frame validation and units, fixed one-second scheduling, independent Metrohm/PC8500/M80 recording, both pH/conductivity combinations, port conflicts and stale worker events, manual chart ranges and current-view PNG/SVG export. Physical serial access is blocked in all unit tests. The 58 warnings are pyqtgraph parameter-default deprecations.
+- The final Windows executable was built from clean commit `0e81777af3f7cf25c83b038f1c63597cd2da852a`. Its M80-only hardware acceptance used an isolated workspace, 38400/8N1, Modbus address 1, and a manually selected adapter. It stored **330 valid conductivity/temperature samples**, including continued recording after a software disconnect and reconnect. No pump or pH device was connected or commanded.
+- The first **300 consecutive samples** spanned **298.984 seconds**. Mean arrival interval was **0.999946 seconds**, minimum **0.953**, maximum **1.047**, and 95th percentile **1.032 seconds**. The deliberate reconnect gap is excluded from these continuous-run statistics.
+- Communication evidence contains **418 requests and 418 responses**, all Modbus function 03 reads, with valid CRCs. There were no instrument-setting, calibration, or other-device commands. Instrument identity, conductivity mode, units and sensor status were checked by the driver. This is communication acceptance, not calibration or chemical-performance validation.
+- The packaged GUI completed recording, loaded the saved history, exported full CSV/JSON and complete report PNG/CSV, and exported the manual viewport as PNG/SVG. All **330 CSV measurement rows matched the database**. Mouse zoom entered manual mode; refresh kept the range; restore-auto and linked X axes worked. An SVG closed-path incompatibility found during the preliminary run was fixed, regression-tested, rebuilt, and retested in the final executable.
+- Chinese and English interface fixtures were inspected at 100%, 125% and 150% scales, with standard and narrower windows. Charge cards use the same 23 pt style. Native packaged Windows windows and exported images were also inspected during M80 acceptance.
+- Original production data/configuration remained separate from acceptance data. Pump protocol/execution, feedback decisions, storage format, charge calculations and units modules are unchanged from the preserved 2.1.1 baseline (`64e7d54`). The release archive contains no experiment databases, personal configuration, bindings or diagnostic logs.
+- Other devices received **software regression only** in this release. Earlier physical results below remain historical; this release does not complete outstanding 24-hour endurance, external gravimetric or physical fault-injection acceptance.
 
 ## Version 2.1.0 acceptance
 

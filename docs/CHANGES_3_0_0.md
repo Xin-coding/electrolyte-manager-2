@@ -10,6 +10,8 @@ All existing interactive plots share automatic/manual X/Y controls, explicit lim
 
 The estimated-charge number now uses the same 23 pt bold style as the other cards. Charge calculations, pump protocols, injection execution/decision rules, EMA processing and the SQLite/experiment-package formats are unchanged. The internal em2 package name and data format are retained.
 
-Validation: 215 automated checks passed before packaging, including read-only protocol fixtures, independent sensors, connection conflicts and chart ranges. Chinese/English UI fixtures were inspected at 100%, 125% and 150%. Unit tests block physical serial access globally. Packaged M80 hardware acceptance results are documented in the release notes and VALIDATION.md; no other device hardware test is claimed for this release.
+Current-view PNG/SVG export also handles the closed paths emitted by the bundled Qt version; empty peer plots and hidden raw curves are covered by a regression test.
+
+Validation: 216 automated checks passed locally and on GitHub, including read-only protocol fixtures, independent sensors, connection conflicts and chart ranges. Chinese/English UI fixtures were inspected at 100%, 125% and 150%. Unit tests block physical serial access globally. Packaged M80 hardware acceptance results are documented in the release notes and VALIDATION.md; no other device hardware test is claimed for this release.
 
 Protocol reference: METTLER TOLEDO M80 SM Modbus Programmer's Guide, register map for identity, sensor type, measurement channels and units. Existing outstanding endurance, gravimetric and physical-fault acceptance is not replaced by communication checks.
