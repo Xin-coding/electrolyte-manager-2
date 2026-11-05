@@ -100,12 +100,26 @@ class Binding:
     port: str
     identity: str
     label: str = ""
+    driver: str = ""
+    address: int = 1
+
+    def __post_init__(self):
+        if self.kind not in {"ph", "ec", "pump"}:
+            raise ValueError("Unsupported device kind")
+        if self.driver not in ({"", "apera_pc8500", "m80"} if self.kind == "ec" else {""}):
+            raise ValueError("Unsupported conductivity model")
+        if type(self.address) is not int or not 1 <= self.address <= 247:
+            raise ValueError("Modbus address must be 1–247")
+
+    @property
+    def sensor_driver(self):
+        return self.driver or ("apera_pc8500" if self.kind == "ec" else "metrohm")
 
 
 @dataclass(frozen=True)
 class Sample:
     kind: str
-    value: float
+    value: float | None
     mono: float
     sequence: int
     identity: str = ""

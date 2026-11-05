@@ -1,68 +1,87 @@
-"""Package only executable dependencies and public documentation, never local data."""
-from datetime import datetime, timezone
+"""Package verified build files and public documentation, never experiment data."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.metadata as metadata
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-import urllib.request
 import zipfile
 
-source = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(source))
+SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
 from em2 import __version__
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--source-ref', default='HEAD', help='Git ref of the packaged application code')
-args = parser.parse_args()
-root = source.parent
-app = root/"app"
-licenses = root/"licenses"
-licenses.mkdir(exist_ok=True)
-for name in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "pyqtgraph", "pyserial", "numpy", "psutil", "pyinstaller", "packaging"):
-    dist = metadata.distribution(name)
-    for file in dist.files or []:
-        if file.name.lower().startswith(("license", "copying", "authors")):
-            target = licenses/name/str(file).replace("..", "_")
-            target.parent.mkdir(parents=True,exist_ok=True)
-            shutil.copy2(dist.locate_file(file), target)
-python_license = Path(sys.base_prefix)/"LICENSE.txt"
-if python_license.exists():
-    shutil.copy2(python_license, licenses/"Python-LICENSE.txt")
-for name,url in (("LGPL-3.0.txt","https://www.gnu.org/licenses/lgpl-3.0.txt"),
-                 ("GPL-3.0.txt","https://www.gnu.org/licenses/gpl-3.0.txt")):
-    target=licenses/name
-    if not target.exists():
-        with urllib.request.urlopen(url,timeout=30) as response:
-            target.write_bytes(response.read())
 
-archive = root/f"ElectrolyteManager-{__version__}-Windows-x64.zip"
-commit = subprocess.check_output(["git","rev-parse",args.source_ref+'^{commit}'],cwd=source,text=True).strip()
-documentation_commit = subprocess.check_output(["git","rev-parse","HEAD"],cwd=source,text=True).strip()
-manifest = {"version":__version__,"source_commit":commit,"built_utc":datetime.now(timezone.utc).isoformat(),
-            "release_channel":"stable", "documentation_commit":documentation_commit,
-            "validation":"24 h endurance not completed: run ended after approximately 1 h 12 min; external gravimetric and physical fault-injection validation remain incomplete",
-            "dependencies":{n:metadata.version(n) for n in ("PySide6","pyqtgraph","pyserial","numpy")}}
-(root/"release.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
-with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED,compresslevel=6) as z:
-    for directory in (app,licenses):
-        for path in directory.rglob("*"):
-            if path.is_file():
-                z.write(path, "Electrolyte-Manager-2.0/"+path.relative_to(root).as_posix())
-    for path in (source/"README.md",source/"LICENSE",root/"release.json"):
-        z.write(path,"Electrolyte-Manager-2.0/"+path.name)
-    for path in (source/"docs").glob("*.md"):
-        z.write(path,"Electrolyte-Manager-2.0/docs/"+path.name)
-    z.writestr("Electrolyte-Manager-2.0/data/.keep","")
-    z.writestr("Electrolyte-Manager-2.0/exports/.keep","")
-with archive.open("rb") as f:
-    digest=hashlib.file_digest(f,"sha256").hexdigest()
-archive.with_suffix(".zip.sha256").write_text(digest+"  "+archive.name+"\n",encoding="ascii")
-with zipfile.ZipFile(archive) as z:
-    bad=[n for n in z.namelist() if n.lower().endswith((".sqlite",".sqlite3",".log",".key",".pem")) or "/data/" in n and not n.endswith(".keep")]
-    assert not bad,bad
-report={**manifest,"archive":str(archive),"sha256":digest,"size_MiB":archive.stat().st_size/1024**2,"private_content_check":"passed"}
-(root/"exports/package-check.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
-print(json.dumps(report,indent=2))
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--build-manifest', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path)
+    args = parser.parse_args()
+    if subprocess.check_output(['git', 'status', '--porcelain'], cwd=SOURCE).strip():
+        raise SystemExit('Packaging requires a clean checkout')
+    build = json.loads(args.build_manifest.read_text(encoding='utf-8'))
+    if build['version'] != __version__:
+        raise SystemExit('Built version does not match source')
+    changed = subprocess.check_output(['git', 'diff', '--name-only', build['source_commit'], 'HEAD', '--', 'em2', 'pyproject.toml', 'tools/build_release.py'], cwd=SOURCE).strip()
+    if changed:
+        raise SystemExit('Application changed since the verified build')
+    app = Path(build['app'])
+    files = {p.relative_to(app).as_posix(): p for p in app.rglob('*') if p.is_file()}
+    if files.keys() != build['files'].keys():
+        raise SystemExit('Build file inventory changed')
+    for name, path in files.items():
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if digest != build['files'][name]:
+            raise SystemExit('Build file was replaced: '+name)
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=SOURCE, text=True).strip()
+    manifest = {'version': __version__, 'release_channel': 'stable', 'source_commit': build['source_commit'],
+                'documentation_commit': head, 'built_utc': build['built_utc'],
+                'packaged_utc': datetime.now(timezone.utc).isoformat(),
+                'exe_sha256': build['files']['ElectrolyteManager.exe'],
+                'dependencies': {name: metadata.version(name) for name in ('PySide6', 'pyqtgraph', 'pyserial', 'numpy')},
+                'validation': 'See release notes and docs/VALIDATION.md. M80 hardware acceptance is read-only; other devices have software regression coverage. Earlier endurance, gravimetric and physical-fault acceptance remains incomplete.'}
+    manifest_path = output/'release.json'
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    archive = output/f'ElectrolyteManager-{__version__}-Windows-x64.zip'
+    prefix = 'Electrolyte-Manager-3.0/'
+    with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for name, path in files.items():
+            z.write(path, prefix+'app/'+name)
+        for name in ('PySide6', 'PySide6_Essentials', 'PySide6_Addons', 'shiboken6', 'pyqtgraph', 'pyserial', 'numpy', 'pyinstaller', 'packaging'):
+            dist = metadata.distribution(name)
+            for file in dist.files or []:
+                if file.name.lower().startswith(('license', 'copying', 'authors')):
+                    z.write(dist.locate_file(file), prefix+'licenses/'+name+'/'+str(file).replace('..', '_').replace('\\', '/'))
+        python_license = Path(sys.base_prefix)/'LICENSE.txt'
+        if python_license.exists():
+            z.write(python_license, prefix+'licenses/Python-LICENSE.txt')
+        for name in ('LGPL-3.0.txt', 'GPL-3.0.txt'):
+            path = SOURCE.parent/'licenses'/name
+            if not path.exists():
+                raise SystemExit('Missing public license: '+str(path))
+            z.write(path, prefix+'licenses/'+name)
+        for path in (SOURCE/'README.md', SOURCE/'LICENSE', manifest_path):
+            z.write(path, prefix+path.name)
+        for path in (SOURCE/'docs').glob('*.md'):
+            z.write(path, prefix+'docs/'+path.name)
+        z.writestr(prefix+'data/.keep', '')
+        z.writestr(prefix+'exports/.keep', '')
+    with zipfile.ZipFile(archive) as z:
+        bad = [name for name in z.namelist() if name.lower().endswith(('.sqlite', '.sqlite3', '.log', '.key', '.pem')) or '/data/' in name and not name.endswith('.keep')]
+        if bad or z.testzip():
+            raise SystemExit('Package integrity or private content check failed')
+    with archive.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    archive.with_suffix('.zip.sha256').write_text(digest+'  '+archive.name+'\n', encoding='ascii')
+    report = {**manifest, 'archive': str(archive), 'sha256': digest, 'private_content_check': 'passed'}
+    (output/'package-check.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == '__main__':
+    main()

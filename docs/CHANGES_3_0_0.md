@@ -1,0 +1,15 @@
+# 3.0.0 — M80 conductivity and explicit chart ranges
+
+Based on the complete 2.1.1 Metrohm serial-handshake repair. Connections now offers Apera PC8500 or METTLER TOLEDO M80; only one conductivity worker owns the selected port. The selected model is remembered, defaults to PC8500 for legacy settings, and is locked during connection or recording. Binding profile version 2 adds driver/address information; version 1 profiles remain readable.
+
+M80 SM uses 38400/8N1 Modbus RTU, default address 1 (editable), ABCD floats, and fixed one-second monotonic polling. The driver verifies identity, conductivity mode and channel units, reads sensor flags plus all four measured channels, and normalizes channel 1 conductivity and channel 2 temperature to mS/cm and degrees C. Only function 03 reads exist in the driver. It does not alter measurement configuration, temperature compensation, calibration or EEPROM. Invalid or mismatched sensor readings remain missing/flagged, never zero or a replacement copy of an old reading. Repeated equal valid values remain separate samples.
+
+Manual connection sends only the selected protocol. Automatic detection retains Metrohm-first ordering, tries only the selected conductivity protocol, skips occupied ports and stops probing each identified port. Worker generations discard delayed events from a previous connection. Identity failures release ports. All sensors can record independently, and losing one sensor does not end the other sensor's recording. PC8500 identity-handshake and buffered-frame handling are preserved.
+
+All existing interactive plots share automatic/manual X/Y controls, explicit limits, restore-auto and full-view actions. Panning/zooming locks the affected axes against refresh; manual live time windows query their historical interval, and old asynchronous requests cannot overwrite a newer view. Linked sensor X axes stay synchronized with independent Y axes. Absolute-time plots accept local date/time. New datasets reset ranges, and pH/OH changes reset the Y axis. Auto Y bounds exclude target and alarm lines. View exports honor the viewport; full reports and CSV exports retain all rows.
+
+The estimated-charge number now uses the same 23 pt bold style as the other cards. Charge calculations, pump protocols, injection execution/decision rules, EMA processing and the SQLite/experiment-package formats are unchanged. The internal em2 package name and data format are retained.
+
+Validation: 215 automated checks passed before packaging, including read-only protocol fixtures, independent sensors, connection conflicts and chart ranges. Chinese/English UI fixtures were inspected at 100%, 125% and 150%. Unit tests block physical serial access globally. Packaged M80 hardware acceptance results are documented in the release notes and VALIDATION.md; no other device hardware test is claimed for this release.
+
+Protocol reference: METTLER TOLEDO M80 SM Modbus Programmer's Guide, register map for identity, sensor type, measurement channels and units. Existing outstanding endurance, gravimetric and physical-fault acceptance is not replaced by communication checks.

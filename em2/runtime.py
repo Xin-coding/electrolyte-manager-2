@@ -35,6 +35,13 @@ class Runtime:
         self.workers = {}
         self.bindings = {}
         self.connections = {}
+        self.connection_ids = {}
+        self.connection_serial = 0
+        self.device_file = self.root/"data/devices.json"
+        preference = read_json(self.device_file, {})
+        choice = Binding("ec", "", "", driver=preference.get("driver", "apera_pc8500"),
+                         address=preference.get("address", 1))
+        self.ec_choice = {"driver": choice.sensor_driver, "address": choice.address}
         self.notices = deque(maxlen=100)
         self.pump_status = {}
         self.hardware = {}
@@ -239,25 +246,46 @@ class Runtime:
             raise ValueError("Device detection is in progress")
         if binding.kind in self.workers:
             raise ValueError("Disconnect this device before changing its port")
-        if any(b.identity == binding.identity or b.port == binding.port for b in self.bindings.values()):
+        if any((binding.identity and b.identity == binding.identity) or b.port.casefold() == binding.port.casefold() for b in self.bindings.values()):
             raise ValueError("This port is already owned by another device")
+        if binding.kind == "ec":
+            self.select_conductivity(binding.sensor_driver, binding.address)
         self.bindings[binding.kind] = binding
+        self.connection_serial += 1
+        token = self.connection_serial
+        self.connection_ids[binding.kind] = token
+        def worker_emit(name, data):
+            self.emit(name, {**data, "_connection_id": token, "_device_kind": binding.kind})
         if binding.kind == "pump" and self.engine.load.identity and self.engine.load.identity != binding.identity:
             self.engine.load.uncertain = True
             self.pending_reason = "Load belongs to a different pump; establish this pump's syringe load"
         self.connections[binding.kind] = {"connected": False, "connecting": True, "endpoint": asdict(binding)}
         if binding.kind == "pump":
-            worker = PumpWorker(binding, self.emit, self.authorize, self.trace)
+            worker = PumpWorker(binding, worker_emit, self.authorize, self.trace)
         else:
-            worker = SensorWorker(binding, self.emit, lambda: self.engine.settings.ph_interval_s, self.trace)
+            worker = SensorWorker(binding, worker_emit, lambda: self.engine.settings.ph_interval_s, self.trace)
         self.workers[binding.kind] = worker
         worker.start()
+
+    def select_conductivity(self, driver, address=1):
+        value = Binding("ec", "", "", driver=driver, address=address)
+        choice = {"driver": value.sensor_driver, "address": value.address}
+        if choice == self.ec_choice:
+            return
+        if self.engine.recording or "ec" in self.workers or self.scan_busy:
+            raise ValueError("End recording and disconnect conductivity before changing its model/address")
+        atomic_json(self.device_file, choice)
+        self.ec_choice = choice
+        self.samples.pop("ec", None)
+        self.connections.pop("ec", None)
 
     def scan(self):
         if self.scan_busy:
             return
         self.scan_busy = True
         used = {b.port for b in self.bindings.values()}
+        used_identities = {b.identity for b in self.bindings.values() if b.identity}
+        choice = dict(getattr(self, "ec_choice", {"driver": "apera_pc8500", "address": 1}))
         # Identify the 9600-baud Metrohm before sending other protocols at
         # 19200/115200, which can leave the meter displaying RS error 38.
         missing = [k for k in ("ph", "ec", "pump") if k not in self.workers]
@@ -265,12 +293,13 @@ class Runtime:
             found = []
             try:
                 for endpoint in ports():
-                    if endpoint["port"] in used:
+                    if endpoint["port"] in used or endpoint["identity"] in used_identities:
                         continue
                     for kind in list(missing):
                         try:
-                            info = identify(kind, endpoint["port"], self.trace)
-                            found.append((Binding(kind, endpoint["port"], endpoint["identity"]), info))
+                            options = choice if kind == "ec" else {}
+                            info = identify(kind, endpoint["port"], self.trace, **options)
+                            found.append((Binding(kind, endpoint["port"], endpoint["identity"], **options), info))
                             missing.remove(kind)
                             break
                         except Exception:
@@ -280,6 +309,12 @@ class Runtime:
         threading.Thread(target=work, name="em2-detection", daemon=True).start()
 
     def handle(self, name, data):
+        if "_connection_id" in data:
+            data = dict(data)
+        token = data.pop("_connection_id", None)
+        kind = data.pop("_device_kind", None)
+        if token is not None and self.connection_ids.get(kind) != token:
+            return
         e = self.engine
         if name == "authorize":
             self._authorize(data)
@@ -293,6 +328,13 @@ class Runtime:
             self.sequence[kind] += 1
             sample = Sample(**data, sequence=self.sequence[kind])
             filtered = e.observe(sample)
+            if not sample.valid:
+                # A failed new M80 measurement must not leave an older sample usable.
+                e.latest.pop(kind, None)
+                e.filtered.pop(kind, None)
+                e.baseline[kind].clear()
+                if self.samples.get(kind, {}).get("quality") != sample.quality:
+                    self.event("measurement_quality", {"kind": kind, "quality": sample.quality})
             self.samples[kind] = {**asdict(sample), "filtered": filtered}
             if self.store and self.finish_context is None:
                 self.store.sample(max(0, sample.mono-self.epoch), sample, filtered)
@@ -378,6 +420,8 @@ class Runtime:
             raise ValueError("Wait for the final injection result to be saved")
         if name == "scan":
             self.scan()
+        elif name == "select_conductivity":
+            self.select_conductivity(**data)
         elif name == "connect":
             self.connect(Binding(**data))
         elif name == "disconnect":
@@ -385,6 +429,7 @@ class Runtime:
             if kind == "pump" and (e.active or e.enabled):
                 raise ValueError("Stop feedback and wait for confirmed stop before disconnecting")
             if kind in self.workers:
+                self.connections.setdefault(kind, {})["closing"] = True
                 self.workers[kind].close()
         elif name == "start_recording":
             if self.store:
@@ -499,6 +544,7 @@ class Runtime:
             "target": e.target, "auto_target": e.auto_target, "mix_remaining": max(0., e.ready_at-time.monotonic()),
             "cumulative_ml": e.cumulative_ml, "elapsed": self.elapsed() if self.store else 0,
             "notices": list(self.notices)[-30:], "scan_busy": self.scan_busy,
+            "ec_choice": self.ec_choice,
             "pending_reason": self.pending_reason, "storage_error": self.local_storage_error or (self.store.error if self.store else ""),
             "pending_allowance": self.pending_allowance,
             "test_block_reason": self.test_block_reason(),

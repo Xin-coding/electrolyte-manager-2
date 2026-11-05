@@ -9,6 +9,7 @@ import serial
 from serial.tools import list_ports
 
 from .wire import Frames, apera_frame, metrohm_values
+from .m80 import M80, next_poll
 
 
 def ports():
@@ -119,6 +120,13 @@ class Apera:
 
     def open(self):
         self.io = serial.Serial(self.port, 19200, timeout=.1, write_timeout=.5)
+        try:
+            return self._handshake()
+        except Exception:
+            self.close()
+            raise
+
+    def _handshake(self):
         self.send("&A#")
         end = time.monotonic()+2
         identity = None
@@ -137,7 +145,15 @@ class Apera:
             self.io.close()
 
 
-def identify(kind, port, log=lambda *_: None):
+def sensor_device(binding, port, log):
+    if binding.kind == "ph":
+        return Metrohm(port, log)
+    if binding.sensor_driver == "m80":
+        return M80(port, log, address=binding.address)
+    return Apera(port, log)
+
+
+def identify(kind, port, log=lambda *_: None, driver="", address=1):
     if kind == "pump":
         from .pump import PumpTransport
         device = PumpTransport(port, log)
@@ -148,7 +164,8 @@ def identify(kind, port, log=lambda *_: None):
             return {"model": "Longer ASP", "status": status, **hardware}
         finally:
             device.close()
-    device = (Metrohm if kind == "ph" else Apera)(port, log)
+    from ..models import Binding
+    device = sensor_device(Binding(kind, port, "", driver=driver, address=address), port, log)
     try:
         return device.open()
     finally:
@@ -176,16 +193,24 @@ class SensorWorker:
             device = None
             try:
                 endpoint = resolve(self.binding)
-                device = (Metrohm if kind == "ph" else Apera)(endpoint["port"], self.log)
+                device = sensor_device(self.binding, endpoint["port"], self.log)
                 info = device.open()
                 if self.expected_serial and info.get("serial") != self.expected_serial:
                     raise ValueError("Instrument identity changed")
                 self.expected_serial = info.get("serial")
                 self.emit("connection", {"kind": kind, "connected": True, "endpoint": endpoint, "info": info})
-                next_read = 0.
+                next_read = time.monotonic()
                 previous_frame_at = None
                 while not self.stop_event.is_set():
                     now = time.monotonic()
+                    if self.binding.sensor_driver == "m80":
+                        if self.stop_event.wait(max(0., next_read-now)):
+                            break
+                        reading = device.read()
+                        self.emit("sample", {"kind": kind, **reading, "mono": time.monotonic(),
+                                             "identity": endpoint["identity"]})
+                        next_read = next_poll(next_read, time.monotonic())
+                        continue
                     if kind == "ph":
                         value, temperature = device.read()
                         self.emit("sample", {"kind": kind, "value": value, "temperature": temperature,

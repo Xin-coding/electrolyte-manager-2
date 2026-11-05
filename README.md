@@ -1,10 +1,12 @@
-# Electrolyte Manager 2.0
+# Electrolyte Manager 3.0
 
-Current version: **2.1.1** (local communication repair). Metrohm HWs connections support both CTS and DSR cable readiness signals, with the selected hardware flow control shown on the Connections page. Detection tries Metrohm at 9600 first to avoid sending other protocols at incompatible baud rates to an identifiable 781. See [communication repair](docs/CHANGES_2_1_1.md).
+Current version: **3.0.0**. Select either Apera PC8500 or METTLER TOLEDO M80 for conductivity. M80 reads once per second through read-only Modbus. All charts have explicit automatic/manual axis controls, and the charge card uses the same font as the other measurements. See [3.0 changes](docs/CHANGES_3_0_0.md).
+
+Includes the complete 2.1.1 Metrohm CTS/DSR handshake repair, with serial parameters shown on Connections. Identified or occupied ports are not probed with other device protocols. Each sensor can read and record independently, without a pump. See [communication repair](docs/CHANGES_2_1_1.md).
 
 Historical pump curves can be compared and exported. Ending a recording generates three PNG charts and three full-data CSVs. The monitor adds charge estimated from declared current, expands plots, and scales signal axes independently of reference lines. Recording must be ended before closing. Existing pump protocols and execution logic are unchanged. See [2.1 changes](docs/CHANGES_2_1_0.md).
 
-Independent Windows acquisition and syringe-pump feedback software for Metrohm 781, Apera PC8500 and Longer ASP. This is a fresh Python / PySide6 application; the previous application is not its code baseline. Hardware protocols and observed firmware behavior were used as references.
+Independent Windows acquisition and syringe-pump feedback software for Metrohm 781, Apera PC8500 or M80 SM, and Longer ASP. The Python package and SQLite format retain their EM2 names for compatibility.
 
 ## Run the portable application
 
@@ -13,7 +15,7 @@ Extract the entire ZIP to a writable folder and open `app/ElectrolyteManager.exe
 The first release provides five pages: Connections, Pump tests, Settings, Monitor, Data manager. The main interface switches between Chinese and English; plots and data analysis use English.
 
 1. Detect devices, check the displayed COM ports and identities, or select each port manually. Save a binding profile if needed.
-2. Set PC8500 automatic upload to **1 minute on the instrument**. Its initial buffered frame is recorded but cannot trigger feedback.
+2. Choose the conductivity model before connecting. PC8500 requires **1 minute automatic upload on the instrument**; its initial buffered frame is recorded but cannot trigger feedback. M80 uses **38400 / 8N1, address 1 by default, fixed 1 s reads**; select its COM port and use the editable address if needed. Its mode, units and calibration are read, never changed. End recording and disconnect before switching models.
 3. Optional: run independent finite-volume or software STOP tests. These use separate test parameters. Test delivery consumes the current syringe load, not the experiment total.
 4. Configure dose, flow, force, load allowance, complete mixing time, control direction, tolerance and fixed alarm boundaries. No dosing values or safety boundaries are guessed.
 5. Start recording. Optional experiment metadata does not block recording. Review the syringe information, then enable feedback separately.

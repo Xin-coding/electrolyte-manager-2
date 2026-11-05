@@ -20,6 +20,7 @@ from .models import Settings, Dose
 from . import forms
 from .paths import atomic_json, read_json
 from .units import hydroxide
+from .chart_range import attach as attach_range
 
 pg.setConfigOptions(antialias=True, background="white", foreground="#17324d")
 
@@ -183,6 +184,9 @@ class Window(W.QMainWindow):
         self.pool = C.QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self.chart_busy = False
+        self.chart_generation = 0
+        self.chart_path = None
+        self.history_request = 0
         self.last_chart = 0
         self.last_error = ""
         self.last_path = ""
@@ -323,6 +327,14 @@ class Window(W.QMainWindow):
             self.navigation.item(i).setText(zh if self.language == "zh" else en)
         for edit in self.numeric_edits():
             edit.show_issue(edit.issue, self.language)
+        plots = [self.ph_plot, self.ec_plot, *self.history_plots]
+        if self.popup:
+            plots.append(self.pump_plot)
+        if self.history_popup:
+            plots.append(self.history_pump_plot)
+        for plot in plots:
+            plot.range_control.set_language()
+        self.update_conductivity_labels()
 
     def numeric_edits(self):
         return [*self.settings_edits().values(), *self.test_edits().values(), self.allowance]
@@ -395,6 +407,21 @@ class Window(W.QMainWindow):
         for kind, title in (("ph", "Metrohm 781 · pH"), ("ec", "Apera PC8500 · Conductivity"), ("pump", "Longer ASP · Syringe pump")):
             group = W.QGroupBox(title)
             form = W.QVBoxLayout(group)
+            if kind == "ec":
+                self.ec_group = group
+                self.ec_model = W.QComboBox()
+                self.ec_model.addItem("Apera PC8500", "apera_pc8500")
+                self.ec_model.addItem("METTLER TOLEDO M80", "m80")
+                self.ec_address = W.QSpinBox()
+                self.ec_address.setRange(1, 247)
+                self.ec_address.setKeyboardTracking(False)
+                self.ec_address.setPrefix("Modbus ")
+                choice = self.runtime.ec_choice
+                self.ec_model.setCurrentIndex(self.ec_model.findData(choice["driver"]))
+                self.ec_address.setValue(choice["address"])
+                form.addLayout(layout_row(self.label("电导率型号", "Conductivity model"), self.ec_model, self.ec_address))
+                self.ec_model.currentIndexChanged.connect(self.conductivity_changed)
+                self.ec_address.valueChanged.connect(self.conductivity_changed)
             state = W.QLabel()
             state.setWordWrap(True)
             combo = W.QComboBox()
@@ -409,7 +436,8 @@ class Window(W.QMainWindow):
             form.addWidget(identity)
             box.addWidget(group)
             self.device_widgets[kind] = (combo, state, identity, connect, disconnect)
-        self.connection_note = self.label("电导率仪请在仪器上设为 1 min 自动上传。", "Set the conductivity instrument to 1 min automatic upload.")
+        self.connection_note = W.QLabel()
+        self.connection_note.setWordWrap(True)
         box.addWidget(self.connection_note)
         diag = W.QCheckBox("Diagnostic communication log · max 200 MiB")
         self.localized.append((diag, "setText", "记录通信诊断日志 · 上限 200 MiB", "Diagnostic communication log · max 200 MiB"))
@@ -417,6 +445,22 @@ class Window(W.QMainWindow):
         box.addWidget(diag)
         box.addStretch()
         return page
+
+    def conductivity_changed(self):
+        self.update_conductivity_labels()
+        self.runtime.command("select_conductivity", driver=self.ec_model.currentData(), address=self.ec_address.value())
+
+    def update_conductivity_labels(self):
+        m80 = self.ec_model.currentData() == "m80"
+        zh = self.language == "zh"
+        self.ec_address.setVisible(m80)
+        self.ec_group.setTitle(("M80" if m80 else "Apera PC8500")+" · Conductivity")
+        message = (("M80：固定每秒读取一次。" if zh else "M80: one reading every second.") if m80 else
+                   ("PC8500：请在仪器上设为 1 min 自动上传。" if zh else "PC8500: set 1 min automatic upload on the instrument."))
+        self.connection_note.setText(message+(" 可单独连接、读数并记录，无需连接其他设备。" if zh else
+                                              " Can read and record independently of other devices."))
+        if hasattr(self, "ec_interval_label"):
+            self.ec_interval_label.setText(message)
 
     def refresh_ports(self):
         self.submit(ports, self.set_ports)
@@ -437,14 +481,15 @@ class Window(W.QMainWindow):
         p = self.device_widgets[kind][0].currentData()
         if not p:
             raise ValueError("Select a COM port")
-        self.runtime.command("connect", kind=kind, port=p["port"], identity=p["identity"])
+        options = {"driver": self.ec_model.currentData(), "address": self.ec_address.value()} if kind == "ec" else {}
+        self.runtime.command("connect", kind=kind, port=p["port"], identity=p["identity"], **options)
 
     def save_bindings(self):
         name = self.profile.text().strip()
         if not name or any(c in name for c in '/\\:*?"<>|'):
             raise ValueError("Enter a valid profile name")
         path = self.root/"data/profiles"/(name+".json")
-        atomic_json(path, {"format": "em2-bindings-1", "bindings": self.runtime.snapshot.get("bindings", {})})
+        atomic_json(path, {"format": "em2-bindings-2", "bindings": self.runtime.snapshot.get("bindings", {})})
         self.notice_text = str(path)
 
     def load_bindings(self):
@@ -452,7 +497,7 @@ class Window(W.QMainWindow):
         if not path:
             return
         data = read_json(path, {})
-        if data.get("format") != "em2-bindings-1":
+        if data.get("format") not in {"em2-bindings-1", "em2-bindings-2"}:
             raise ValueError("Unsupported binding profile")
         for binding in data["bindings"].values():
             self.runtime.command("connect", **binding)
@@ -605,7 +650,9 @@ class Window(W.QMainWindow):
         self.fields["ph_interval_s"] = line_number()
         form.addRow(self.label("pH 采集间隔 (s)", "pH sampling interval (s)"), self.fields["ph_interval_s"].container)
         self.watch_number(self.fields["ph_interval_s"], self.validate_settings_form)
-        form.addRow(self.label("电导率采样间隔", "Conductivity sampling interval"), W.QLabel("1 min · instrument setting"))
+        self.ec_interval_label = W.QLabel()
+        self.ec_interval_label.setWordWrap(True)
+        form.addRow(self.label("电导率采样间隔", "Conductivity sampling interval"), self.ec_interval_label)
         self.smoothing = W.QCheckBox("EMA · α = 0.5")
         form.addRow(self.label("平滑显示与正常反馈", "Smooth display and normal feedback"), self.smoothing)
         box.addWidget(group)
@@ -718,7 +765,7 @@ class Window(W.QMainWindow):
         plot.showGrid(x=True, y=True, alpha=.13)
         plot.setMinimumHeight(210)
         plot.addLegend(offset=(10, 8))
-        return plot
+        return attach_range(plot, lambda: self.language)
 
     def build_monitor(self):
         page = W.QWidget()
@@ -748,8 +795,6 @@ class Window(W.QMainWindow):
             v.addWidget(self.label(zh, en))
             value = W.QLabel("—")
             value.setObjectName("cardValue")
-            if key == "charge":
-                value.setStyleSheet("font-size: 16pt;")
             v.addWidget(value)
             unit_label = W.QLabel(unit)
             v.addWidget(unit_label)
@@ -785,9 +830,15 @@ class Window(W.QMainWindow):
         plots = W.QHBoxLayout()
         self.ph_plot = self.make_plot("pH feedback", "pH")
         self.ec_plot = self.make_plot("Conductivity", "Conductivity (mS/cm)")
-        self.ec_plot.setXLink(self.ph_plot)
-        plots.addWidget(self.ph_plot)
-        plots.addWidget(self.ec_plot)
+        self.ec_plot.range_control.link_x(self.ph_plot.range_control)
+        for plot in (self.ph_plot, self.ec_plot):
+            plots.addWidget(plot.panel)
+            plot.range_control.changed.connect(self.invalidate_charts)
+            plot.range_control.full_requested.connect(self.full_live_range)
+        self.window_box.currentIndexChanged.connect(self.live_window_changed)
+        self.ph_axis.currentIndexChanged.connect(self.ph_unit_changed)
+        self.raw_check.toggled.connect(self.invalidate_charts)
+        self.processed_check.toggled.connect(self.invalidate_charts)
         box.addLayout(plots, 1)
         self.live_curves = {}
         for kind, plot in (("ph", self.ph_plot), ("ec", self.ec_plot)):
@@ -802,6 +853,22 @@ class Window(W.QMainWindow):
             self.target_lines.append(lines)
 
         return page
+
+    def invalidate_charts(self, *_):
+        self.chart_generation += 1
+        self.last_chart = 0
+
+    def live_window_changed(self, *_):
+        self.ph_plot.range_control.set_axis(0, False)
+        self.invalidate_charts()
+
+    def full_live_range(self):
+        self.window_box.setCurrentIndex(2)
+        self.live_window_changed()
+
+    def ph_unit_changed(self, *_):
+        self.ph_plot.range_control.set_axis(1, False)
+        self.invalidate_charts()
 
     def enable_control(self):
         settings = self.runtime.snapshot["settings"]
@@ -848,9 +915,9 @@ class Window(W.QMainWindow):
         box.addLayout(row)
         plots = W.QHBoxLayout()
         self.history_plots = [self.make_plot("pH comparison", "pH"), self.make_plot("Conductivity comparison", "Conductivity (mS/cm)")]
-        self.history_plots[1].setXLink(self.history_plots[0])
+        self.history_plots[1].range_control.link_x(self.history_plots[0].range_control)
         for plot in self.history_plots:
-            plots.addWidget(plot)
+            plots.addWidget(plot.panel)
         box.addLayout(plots, 1)
         self.history_detail = W.QPlainTextEdit()
         self.history_detail.setReadOnly(True)
@@ -886,13 +953,15 @@ class Window(W.QMainWindow):
         return paths
 
     def compare_history(self):
+        self.history_request += 1
+        request = self.history_request
         start, end = self.history_range(submit=True)
         paths = self.selected_history()
         field = self.history_field.currentText()
         absolute = self.align.currentIndex() == 1
         def read():
             return [(storage.summary(path), [storage.series(path, k, field, start*60, end*60 if end is not None else None) for k in ("ph", "ec")], storage.recent_events(path, 20)) for path in paths]
-        self.submit(read, lambda data: self.draw_history(data, absolute))
+        self.submit(read, lambda data: self.draw_history(data, absolute) if request == self.history_request else None)
         if self.history_popup:
             self.load_history_pump(paths, start, end, absolute)
 
@@ -919,6 +988,7 @@ class Window(W.QMainWindow):
             plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
             plot.setLabel("bottom", "Time (local)" if absolute else "Elapsed time (min)")
             plot.getAxis("bottom").enableAutoSIPrefix(False)
+            plot.range_control.reset(absolute=absolute)
         colors = ["#167cb5", "#13a192", "#a85eb3", "#da8438", "#cc506d", "#6c8d34"]
         details = []
         for i, (meta, series, events) in enumerate(data):
@@ -929,6 +999,8 @@ class Window(W.QMainWindow):
                     plot.plot(x, [r[1] for r in rows], pen=pg.mkPen(colors[i%len(colors)], width=2), name=Path(meta["path"]).stem)
             details.append(json.dumps({"file": meta["path"], "metadata": meta, "recent_events": events}, ensure_ascii=False, indent=2))
         self.history_detail.setPlainText("\n\n".join(details))
+        for plot in self.history_plots:
+            plot.range_control.apply()
 
     def import_history(self):
         path, _ = W.QFileDialog.getOpenFileName(self, "Import EM2 package", str(self.root/"exports"), "EM2 package (*.em2zip)")
@@ -975,7 +1047,7 @@ class Window(W.QMainWindow):
             self.history_pump_note.setWordWrap(True)
             box.addWidget(self.history_pump_note)
             self.history_pump_plot = self.make_plot("Pump injection comparison", "Cumulative injection (mL)")
-            box.addWidget(self.history_pump_plot, 1)
+            box.addWidget(self.history_pump_plot.panel, 1)
             box.addLayout(layout_row(
                 self.button("Export PNG / SVG", "Export PNG / SVG", lambda: self.export_plots([self.history_pump_plot])),
                 self.button("Export pump CSV", "Export pump CSV", self.export_history_pump_csv)))
@@ -1002,6 +1074,7 @@ class Window(W.QMainWindow):
             plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
             plot.setLabel("bottom", "Time (local)" if absolute else "Elapsed time (min)")
             plot.getAxis("bottom").enableAutoSIPrefix(False)
+            plot.range_control.reset(absolute=absolute)
             notes = []
             for i, entry in enumerate(data):
                 name = Path(entry["meta"]["path"]).stem
@@ -1009,7 +1082,7 @@ class Window(W.QMainWindow):
                 charts.draw_pump(plot, entry, color, name, absolute)
                 notes.append(f"{name}: {entry['count']} injections, {entry['estimates']} estimated, {entry['unknown']} unknown")
             self.history_pump_note.setText("\n".join(notes))
-            plot.enableAutoRange()
+            plot.range_control.apply()
         self.submit(lambda: [reporting.pump_series(p, start*60, end*60 if end is not None else None) for p in paths], draw)
 
     def export_history_pump_csv(self):
@@ -1090,7 +1163,8 @@ class Window(W.QMainWindow):
         box.addWidget(self.pump_detail)
         self.pump_plot = self.make_plot("Cumulative injection volume", "Delivered volume (mL)")
         self.pump_curve = self.pump_plot.plot(pen=pg.mkPen("#167cb5", width=2), symbol="o", symbolSize=4, name="Accounted volume")
-        box.addWidget(self.pump_plot, 1)
+        box.addWidget(self.pump_plot.panel, 1)
+        self.pump_plot.range_control.changed.connect(self.invalidate_charts)
         self.refill_lines = []
         box.addWidget(self.button("导出加液曲线", "Export volume plot", lambda: self.export_plots([self.pump_plot])))
         dialog.destroyed.connect(lambda: setattr(self, "popup", None))
@@ -1099,25 +1173,39 @@ class Window(W.QMainWindow):
         self.last_chart = 0
 
     def query_charts(self, snap):
-        path = snap.get("path")
-        pump_path = path or (snap.get("last_completed") or {}).get("path") or snap.get("test_path")
+        completed = snap.get("last_completed") or {}
+        path = snap.get("path") or completed.get("path")
+        pump_path = path or snap.get("test_path")
         if not path and not (self.popup and pump_path):
             return
+        if path != self.chart_path:
+            self.chart_path = path
+            for plot in (self.ph_plot, self.ec_plot):
+                plot.range_control.reset()
+            if self.popup:
+                self.pump_plot.range_control.reset()
         self.chart_busy = True
+        generation = self.chart_generation
         window = self.window_box.currentData()
-        start = max(0., snap["elapsed"]-window) if window else 0.
+        elapsed = snap["elapsed"] if snap.get("path") else completed.get("duration", 0.)
+        start = max(0., elapsed-window) if window else 0.
+        auto_range = (start/60, max(elapsed/60, start/60+1/60))
+        manual_range = self.ph_plot.range_control.x_query()
+        start, end = (max(0., manual_range[0]*60), max(0., manual_range[1]*60)) if manual_range else (start, None)
         show_pump = self.popup is not None
+        pump_range = self.pump_plot.range_control.x_query() if show_pump else None
         def read():
-            curves = {kind: {field: storage.series(path, kind, field, start) for field in ("raw", "filtered")} for kind in ("ph", "ec")} if path else {}
-            injections = reporting.pump_series(pump_path, end=snap["elapsed"] if path else None) if show_pump and pump_path else None
-            events = []
-            return path, curves, injections, events
+            curves = {kind: {field: storage.series(path, kind, field, start, end) for field in ("raw", "filtered")} for kind in ("ph", "ec")} if path else {}
+            injections = reporting.pump_series(pump_path, start=max(0., pump_range[0]*60) if pump_range else 0.,
+                                              end=max(0., pump_range[1]*60) if pump_range else elapsed if path else None) if show_pump and pump_path else None
+            return generation, path, curves, injections, auto_range
         self.submit(read, self.draw_charts)
 
     def draw_charts(self, data):
         self.chart_busy = False
-        path, curves, injections, events = data
-        if path and path != self.runtime.snapshot.get("path"):
+        generation, path, curves, injections, auto_range = data
+        current = self.runtime.snapshot
+        if generation != self.chart_generation or path and path != (current.get("path") or (current.get("last_completed") or {}).get("path")):
             return
         oh = self.ph_axis.currentIndex() == 1
         self.ph_plot.setLabel("left", "Estimated OH⁻ (mmol/L)" if oh else "pH")
@@ -1126,9 +1214,13 @@ class Window(W.QMainWindow):
                 values = [hydroxide(r[1], r[2]) if oh and kind == "ph" else r[1] for r in rows]
                 self.live_curves[kind][field].setData([r[0]/60 for r in rows], values, connect="finite")
                 self.live_curves[kind][field].setVisible(self.raw_check.isChecked() if field == "raw" else self.processed_check.isChecked())
+        for plot in (self.ph_plot, self.ec_plot):
+            plot.range_control.auto_x = auto_range
+            plot.range_control.apply()
         if self.popup and injections:
             self.pump_plot.clear()
             charts.draw_pump(self.pump_plot, injections)
+            self.pump_plot.range_control.apply()
 
 
     def refresh(self):
@@ -1136,6 +1228,14 @@ class Window(W.QMainWindow):
         if not s:
             return
         zh = self.language == "zh"
+        choice = s.get("ec_choice", self.runtime.ec_choice)
+        with C.QSignalBlocker(self.ec_model), C.QSignalBlocker(self.ec_address):
+            self.ec_model.setCurrentIndex(self.ec_model.findData(choice["driver"]))
+            self.ec_address.setValue(choice["address"])
+        can_choose = not s["recording"] and "ec" not in s["bindings"] and not s["scan_busy"]
+        self.ec_model.setEnabled(can_choose)
+        self.ec_address.setEnabled(can_choose)
+        self.update_conductivity_labels()
         for kind, (combo, state, identity, connect, disconnect) in self.device_widgets.items():
             info = s["connections"].get(kind, {})
             bound = s["bindings"].get(kind, {})
@@ -1144,6 +1244,11 @@ class Window(W.QMainWindow):
             color = "#168a68" if connected else "#bb7c24" if bound else "#788b9a"
             connection_detail = (info.get("info", {}).get("serial_settings", "") if connected
                                  else info.get("error", ""))
+            quality = s["samples"].get(kind, {}).get("quality", "valid")
+            if connected and quality != "valid":
+                quality_text = {"sensor_disconnected": "探头未连接", "sensor_type_mismatch": "探头类型不匹配",
+                                "invalid_measurement": "测量值无效"}
+                connection_detail += " · "+(quality_text.get(quality, quality) if zh else quality.replace("_", " "))
             state.setText(f"●  {status}   {info.get('endpoint', bound).get('port', '')}   {connection_detail}")
             state.setStyleSheet(f"color: {color}; font-weight: 600;")
             identity.setText("Device identity: "+str(bound.get("identity", "—")))
