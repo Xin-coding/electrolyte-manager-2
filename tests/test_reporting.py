@@ -28,6 +28,17 @@ def experiment(folder, name="Report", purpose="experiment", amounts=(.1, .2, .3)
             "load": {"used_ml": amount}})
     store.event(25., "refill", {})
     store.sample(1., Sample("ph", 7., 1., 1, temperature=25.), 7.)
+    # This is a chart-data fixture, not a disk throughput benchmark. Hosted
+    # Windows runners may need >3 seconds to persist the 10,000-row fixture.
+    if len(amounts) > 1000:
+        deadline = time.monotonic()+30
+        while True:
+            with storage.readonly(store.path) as db:
+                saved = db.execute("SELECT COUNT(*) FROM injections").fetchone()[0]
+            if saved == len(amounts):
+                break
+            assert time.monotonic() < deadline and not store.dropped, (saved, store.error)
+            time.sleep(.05)
     assert store.finalize(100., {}, "2026-10-20T01:00:00+00:00")
     assert store.close(finalized=True)
     return store.path
