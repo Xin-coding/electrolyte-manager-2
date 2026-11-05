@@ -137,7 +137,6 @@ class RangeController(C.QObject):
         previous = view.menu
         self.menu = StableRangeMenu(view, self)
         view.menu = self.menu
-        self.menu.setParent(plot)
         if previous:
             previous.deleteLater()
         plot.plotItem.setMenuEnabled(True)

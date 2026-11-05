@@ -62,6 +62,7 @@ def test_native_range_menu_errors_unit_switch_and_refresh_protects_draft(window)
     assert not p.manual[1] and p.manual[0]
     assert w.ph_plot.panel is w.ph_plot
     menu = p.menu
+    assert menu.isWindow() and not menu.isVisible()
     edits = [menu.ctrl[0].minText, menu.ctrl[0].maxText]
     menu.begin_edit(0)
     edits[0].setText("nan")
