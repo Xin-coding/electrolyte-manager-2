@@ -1,7 +1,120 @@
 """Explicit viewport state, independent of data replacement and report exports."""
 import math
 
-from PySide6 import QtCore as C, QtWidgets as W
+from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
+from pyqtgraph.graphicsItems.ViewBox.ViewBoxMenu import ViewBoxMenu
+
+
+class StableRangeMenu(ViewBoxMenu):
+    """The 2.1 plot context menu, with range drafts protected from live refresh."""
+    def __init__(self, view, controller):
+        self.controller = controller
+        self.editing = [False, False]
+        self.submenus = []
+        super().__init__(view)
+        # PySide 6.11 may destroy a submenu when its temporary QAction wrapper
+        # is collected. Keep both the menus and their actions alive together.
+        self.action_refs = self.actions() + [a for menu in self.submenus for a in menu.actions()]
+        for axis, ui in enumerate(self.ctrl):
+            for edit in (ui.minText, ui.maxText):
+                edit.setValidator(None)
+                edit.installEventFilter(self)
+                edit.textEdited.connect(lambda _, a=axis: self.begin_edit(a))
+
+    def addMenu(self, *args):
+        # Retain the submenu wrappers for the lifetime of this menu.
+        menu = super().addMenu(*args)
+        self.submenus.append(menu)
+        return menu
+
+    def begin_edit(self, axis):
+        self.editing[axis] = True
+        if not self.controller.manual[axis]:
+            self.controller.set_axis(axis, True)
+
+    def eventFilter(self, obj, event):
+        if event.type() == C.QEvent.Type.FocusIn:
+            for axis, ui in enumerate(self.ctrl):
+                if obj in (ui.minText, ui.maxText):
+                    self.begin_edit(axis)
+        return super().eventFilter(obj, event)
+
+    def updateState(self):
+        held = []
+        blockers = []
+        for axis, ui in enumerate(self.ctrl):
+            for name in ("manualRadio", "autoRadio", "autoPercentSpin", "mouseCheck", "linkCombo",
+                         "autoPanCheck", "visibleOnlyCheck", "invertCheck"):
+                blockers.append(C.QSignalBlocker(getattr(ui, name)))
+            if self.editing[axis]:
+                for edit in (ui.minText, ui.maxText):
+                    held.append((edit, edit.text(), edit.cursorPosition(), edit.selectionStart(), len(edit.selectedText())))
+        super().updateState()
+        # Retain second-level precision on absolute-time axes as well.
+        for axis, ui in enumerate(self.ctrl):
+            if not self.editing[axis]:
+                for edit, value in zip((ui.minText, ui.maxText), self.view().getState(copy=False)["targetRange"][axis]):
+                    edit.setText(format(value, ".12g"))
+        for edit, text, cursor, start, length in held:
+            if edit.text() != text:
+                edit.setText(text)
+            if start >= 0:
+                edit.setSelection(start, length)
+            else:
+                edit.setCursorPosition(cursor)
+        for axis, ui in enumerate(self.ctrl):
+            ui.manualRadio.setChecked(self.controller.manual[axis])
+            ui.autoRadio.setChecked(not self.controller.manual[axis])
+        del blockers
+
+    def set_language(self):
+        zh = self.controller.language() == "zh"
+        self.viewAll.setText("查看全图" if zh else "View All")
+        for ui in self.ctrl:
+            ui.manualRadio.setText("手动" if zh else "Manual")
+            ui.autoRadio.setText("自动" if zh else "Auto")
+
+    def commit_range(self, axis):
+        ui = self.ctrl[axis]
+        try:
+            values = tuple(float(e.text()) for e in (ui.minText, ui.maxText))
+            if not all(math.isfinite(v) for v in values) or values[0] >= values[1]:
+                raise ValueError()
+        except ValueError:
+            self.editing[axis] = True
+            message = "请输入有效上下限，且下限小于上限" if self.controller.language() == "zh" else "Enter finite limits; lower must be below upper"
+            for edit in (ui.minText, ui.maxText):
+                edit.setStyleSheet("border: 2px solid #b83645; background: #fff5f5;")
+                edit.setToolTip(message)
+            return
+        self.editing[axis] = False
+        for edit in (ui.minText, ui.maxText):
+            edit.setStyleSheet("")
+            edit.setToolTip("")
+        self.controller.set_axis(axis, True, values)
+
+    def automatic(self, axis, fraction=None):
+        self.clear_draft(axis)
+        self.controller.auto_fraction[axis] = fraction if fraction is not None else self.ctrl[axis].autoPercentSpin.value()*.01
+        self.controller.set_axis(axis, False)
+
+    def autoRange(self):
+        self.controller.full()
+
+    def clear_draft(self, axis):
+        self.editing[axis] = False
+        for edit in (self.ctrl[axis].minText, self.ctrl[axis].maxText):
+            edit.setStyleSheet("")
+            edit.setToolTip("")
+
+    def xManualClicked(self): self.controller.set_axis(0, True)
+    def yManualClicked(self): self.controller.set_axis(1, True)
+    def xRangeTextChanged(self): self.commit_range(0)
+    def yRangeTextChanged(self): self.commit_range(1)
+    def xAutoClicked(self): self.automatic(0)
+    def yAutoClicked(self): self.automatic(1)
+    def xAutoSpinChanged(self, value): self.automatic(0, value*.01)
+    def yAutoSpinChanged(self, value): self.automatic(1, value*.01)
 
 
 class RangeController(C.QObject):
@@ -18,47 +131,24 @@ class RangeController(C.QObject):
         self.revision = 0
         self.guard = False
         self.peers = []
-        self.dialog = None
-        self.panel = W.QWidget()
-        column = W.QVBoxLayout(self.panel)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(4)
-        column.addWidget(plot, 1)
-        bar = W.QHBoxLayout()
-        bar.setSpacing(4)
-        self.modes = []
-        for axis in range(2):
-            bar.addWidget(W.QLabel("X" if axis == 0 else "Y"))
-            combo = W.QComboBox()
-            combo.setMinimumContentsLength(2)
-            combo.addItems(["自动", "手动"])
-            combo.currentIndexChanged.connect(lambda index, a=axis: self.change_mode(a, bool(index)))
-            bar.addWidget(combo)
-            self.modes.append(combo)
-        self.edit_button = W.QPushButton()
-        self.edit_button.clicked.connect(self.edit_range)
-        self.auto_button = W.QPushButton()
-        self.auto_button.clicked.connect(self.restore)
-        self.full_button = W.QPushButton()
-        self.full_button.clicked.connect(self.full)
-        for button in (self.edit_button, self.auto_button, self.full_button):
-            button.setStyleSheet("padding: 4px 7px;")
-            bar.addWidget(button)
-        bar.addStretch()
-        column.addLayout(bar)
+        self.auto_fraction = [True, True]
+        self.panel = plot
+        view = plot.getViewBox()
+        previous = view.menu
+        self.menu = StableRangeMenu(view, self)
+        view.menu = self.menu
+        self.menu.setParent(plot)
+        if previous:
+            previous.deleteLater()
+        plot.plotItem.setMenuEnabled(True)
+        plot.plotItem.showButtons()
+        plot.plotItem.autoBtn.clicked.disconnect(plot.plotItem.autoBtnClicked)
+        plot.plotItem.autoBtn.clicked.connect(self.restore)
+        view.sigRangeChangedManually.connect(self.mouse_range)
         self.set_language()
-        plot.plotItem.setMenuEnabled(False)
-        plot.plotItem.hideButtons()
-        plot.getViewBox().sigRangeChangedManually.connect(self.mouse_range)
 
     def set_language(self):
-        zh = self.language() == "zh"
-        for combo in self.modes:
-            combo.setItemText(0, "自动" if zh else "Auto")
-            combo.setItemText(1, "手动" if zh else "Manual")
-        self.edit_button.setText("范围…" if zh else "Range…")
-        self.auto_button.setText("恢复自动" if zh else "Auto")
-        self.full_button.setText("全图" if zh else "Full")
+        self.menu.set_language()
 
     def link_x(self, other):
         self.peers.append(other)
@@ -71,22 +161,19 @@ class RangeController(C.QObject):
     def x_query(self):
         return tuple(self.bounds[0]) if self.manual[0] and self.bounds[0] else None
 
-    def _sync_combo(self, axis):
-        combo = self.modes[axis]
-        with C.QSignalBlocker(combo):
-            combo.setCurrentIndex(int(self.manual[axis]))
-
     def set_axis(self, axis, manual, bounds=None, *, propagate=True):
         if bounds is not None:
             bounds = tuple(float(v) for v in bounds)
             if not all(math.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]:
                 raise ValueError("Invalid axis range")
         self.manual[axis] = manual
+        if not manual:
+            self.menu.clear_draft(axis)
         if manual:
             self.bounds[axis] = bounds or tuple(self.plot.viewRange()[axis])
-        self._sync_combo(axis)
         self.revision += 1
         self.apply()
+        self.menu.updateState()
         if axis == 0 and propagate:
             for peer in self.peers:
                 peer.set_axis(0, manual, self.bounds[0], propagate=False)
@@ -116,7 +203,7 @@ class RangeController(C.QObject):
                     else:
                         self.plot.setYRange(*bounds, padding=0)
                 else:
-                    self.plot.enableAutoRange(axis=axis, enable=True)
+                    self.plot.enableAutoRange(axis=axis, enable=self.auto_fraction[axis])
         finally:
             self.guard = False
 
@@ -139,69 +226,7 @@ class RangeController(C.QObject):
         self.restore()
 
     def edit_range(self):
-        if self.dialog:
-            self.dialog.raise_()
-            return
-        zh = self.language() == "zh"
-        dialog = W.QDialog(self.panel)
-        self.dialog = dialog
-        dialog.setAttribute(C.Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.setWindowTitle("图表范围" if zh else "Chart range")
-        grid = W.QGridLayout(dialog)
-        titles = ["轴", "模式", "下限", "上限"] if zh else ["Axis", "Mode", "Lower", "Upper"]
-        for col, title in enumerate(titles):
-            grid.addWidget(W.QLabel(title), 0, col)
-        modes, editors = [], []
-        for axis in range(2):
-            grid.addWidget(W.QLabel(("X · 本地时间" if zh else "X · Local time") if axis == 0 and self.absolute
-                                   else "X · min" if axis == 0 else "Y"), axis+1, 0)
-            mode = W.QComboBox()
-            mode.addItems(["自动", "手动"] if zh else ["Auto", "Manual"])
-            mode.setCurrentIndex(int(self.manual[axis]))
-            modes.append(mode)
-            grid.addWidget(mode, axis+1, 1)
-            row = []
-            for col, value in enumerate(self.plot.viewRange()[axis], 2):
-                if axis == 0 and self.absolute:
-                    edit = W.QDateTimeEdit(C.QDateTime.fromMSecsSinceEpoch(round(value*1000)))
-                    edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss.zzz")
-                    edit.setCalendarPopup(True)
-                else:
-                    edit = W.QLineEdit(format(value, ".12g"))
-                    edit.setMinimumWidth(120)
-                grid.addWidget(edit, axis+1, col)
-                edit.setEnabled(bool(mode.currentIndex()))
-                row.append(edit)
-            mode.currentIndexChanged.connect(lambda i, fields=row: [e.setEnabled(bool(i)) for e in fields])
-            editors.append(row)
-        error = W.QLabel()
-        error.setStyleSheet("color:#b83645")
-        error.setWordWrap(True)
-        grid.addWidget(error, 3, 0, 1, 4)
-        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Apply | W.QDialogButtonBox.StandardButton.Close)
-        grid.addWidget(buttons, 4, 0, 1, 4)
-        def apply():
-            proposed = []
-            try:
-                for axis in range(2):
-                    if not modes[axis].currentIndex():
-                        proposed.append(None)
-                        continue
-                    values = tuple(e.dateTime().toMSecsSinceEpoch()/1000 if isinstance(e, W.QDateTimeEdit)
-                                   else float(e.text().strip()) for e in editors[axis])
-                    if not all(math.isfinite(v) for v in values) or values[0] >= values[1]:
-                        raise ValueError()
-                    proposed.append(values)
-            except ValueError:
-                error.setText("请输入有效上下限，下限必须小于上限。" if zh else "Enter finite limits; lower must be below upper.")
-                return
-            for axis in range(2):
-                self.set_axis(axis, proposed[axis] is not None, proposed[axis])
-            error.setText("已应用" if zh else "Applied")
-        buttons.button(W.QDialogButtonBox.StandardButton.Apply).clicked.connect(apply)
-        buttons.rejected.connect(dialog.close)
-        dialog.destroyed.connect(lambda: setattr(self, "dialog", None))
-        dialog.show()
+        self.menu.popup(G.QCursor.pos())
 
 
 def attach(plot, language):

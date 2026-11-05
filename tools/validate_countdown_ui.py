@@ -39,9 +39,15 @@ with tempfile.TemporaryDirectory() as temporary:
             w.resize(*size)
             for language in (0,1):
                 w.switch_language(language); w.navigation.setCurrentRow(3)
-                for state in ("pending", "failed"):
+                for state in ("pending", "failed", "invalid"):
                     r.countdown = {"state":state,"id":1,"deadline":time.monotonic()+3*3600+15*60,
                                    "expected_at":time.time()+3*3600+15*60,"reason":"stale" if state=="failed" else ""}
+                    if state == "invalid":
+                        r.countdown = {"state": "idle"}
+                        w.delay_hours.edit.setText("1.5")
+                        w.delay_minutes.edit.setText("abc")
+                    else:
+                        w.delay_hours.setValue(3); w.delay_minutes.setValue(15)
                     r.publish(); w.refresh()
                     for _ in range(4): app.processEvents()
                     name=f"countdown-{args.scale}-{size[0]}-{'zh' if language==0 else 'en'}-{state}.png"

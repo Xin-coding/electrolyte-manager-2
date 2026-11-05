@@ -58,8 +58,13 @@ with tempfile.TemporaryDirectory() as temporary:
                     results.append({"file": filename, "width": window.width(), "height": window.height(), "charge_font_pt": window.cards["charge"].font().pointSizeF()})
         window.ph_plot.range_control.edit_range()
         app.processEvents()
-        window.ph_plot.range_control.dialog.grab().save(str(args.output/f"range-dialog-{args.scale}.png"))
-        window.ph_plot.range_control.dialog.close()
+        window.ph_plot.range_control.menu.grab().save(str(args.output/f"range-menu-{args.scale}.png"))
+        menu = window.ph_plot.range_control.menu
+        menu.submenus[0].popup(window.mapToGlobal(window.rect().center()))
+        app.processEvents()
+        menu.submenus[0].grab().save(str(args.output/f"range-x-axis-{args.scale}.png"))
+        menu.submenus[0].close()
+        window.ph_plot.range_control.menu.close()
     finally:
         runtime.close(); runtime.thread.join(10)
         window.close(); app.processEvents()

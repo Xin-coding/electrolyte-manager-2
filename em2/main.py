@@ -10,7 +10,7 @@ from .ui import Window
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("Electrolyte Manager 3.1")
+    app.setApplicationName("Electrolyte Manager 3.2")
     app.setOrganizationName("Xin-coding")
     root = root_dir()
     (root/"data").mkdir(parents=True, exist_ok=True)

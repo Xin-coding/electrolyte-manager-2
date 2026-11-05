@@ -4,7 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
 
 import pytest
-from PySide6 import QtCore as C, QtWidgets as W
+from PySide6 import QtCore as C, QtWidgets as W, QtTest
 
 from em2.runtime import Runtime
 from em2.ui import Window
@@ -51,7 +51,7 @@ def test_linked_x_independent_y_and_refresh_preserves_manual_view(window):
     assert w.ph_plot.viewRange()[0] == pytest.approx([0, 60])
 
 
-def test_mouse_range_dialog_errors_dates_and_unit_switch(window):
+def test_native_range_menu_errors_unit_switch_and_refresh_protects_draft(window):
     w, _, app = window
     p = w.ph_plot.range_control
     w.ph_plot.setXRange(2, 4, padding=0)
@@ -60,27 +60,63 @@ def test_mouse_range_dialog_errors_dates_and_unit_switch(window):
     p.set_axis(1, True, (6, 8))
     w.ph_axis.setCurrentIndex(1)
     assert not p.manual[1] and p.manual[0]
-    p.edit_range()
-    app.processEvents()
-    dialog = p.dialog
-    edits = dialog.findChildren(W.QLineEdit)
+    assert w.ph_plot.panel is w.ph_plot
+    menu = p.menu
+    edits = [menu.ctrl[0].minText, menu.ctrl[0].maxText]
+    menu.begin_edit(0)
     edits[0].setText("nan")
-    buttons = dialog.findChild(W.QDialogButtonBox)
     before = p.x_query()
-    buttons.button(W.QDialogButtonBox.StandardButton.Apply).click()
+    menu.xRangeTextChanged()
     assert p.x_query() == before
-    assert any("下限" in label.text() and "请输入" in label.text() for label in dialog.findChildren(W.QLabel))
+    assert "请输入" in edits[0].toolTip()
+    for i in range(5):
+        p.auto_x = (0, 100+i)
+        p.apply()
+        menu.updateState()
+        assert edits[0].text() == "nan"
     edits[0].setText("1")
     edits[1].setText("5")
-    buttons.button(W.QDialogButtonBox.StandardButton.Apply).click()
+    menu.xRangeTextChanged()
     assert p.x_query() == (1, 5)
-    dialog.close()
-    C.QCoreApplication.sendPostedEvents(None, C.QEvent.Type.DeferredDelete)
+    assert not edits[0].toolTip()
     p.reset(absolute=True)
-    w.ph_plot.setXRange(1700000000, 1700000060, padding=0)
-    p.edit_range(); app.processEvents()
-    assert len(p.dialog.findChildren(W.QDateTimeEdit)) == 2
-    p.dialog.close()
+    menu.begin_edit(0)
+    edits[0].setText("1700000000")
+    edits[1].setText("1700000060")
+    menu.xRangeTextChanged()
+    assert p.x_query() == (1700000000, 1700000060)
+    assert [float(e.text()) for e in edits] == [1700000000, 1700000060]
+    menu.xAutoClicked()
+    assert not p.manual[0]
+
+
+def test_real_menu_focus_draft_survives_refresh_and_restore_clears_it(window):
+    w, _, app = window
+    p = w.ph_plot.range_control
+    p.auto_x = (0, 60)
+    p.apply()
+    submenu = p.menu.actions()[1].menu()
+    submenu.popup(w.mapToGlobal(w.rect().center()))
+    app.processEvents()
+    low, high = p.menu.ctrl[0].minText, p.menu.ctrl[0].maxText
+    QtTest.QTest.mouseClick(low, C.Qt.MouseButton.LeftButton)
+    QtTest.QTest.keyClick(low, C.Qt.Key.Key_A, C.Qt.KeyboardModifier.ControlModifier)
+    QtTest.QTest.keyClicks(low, "1.")
+    low.setCursorPosition(1)
+    for i in range(4):
+        p.auto_x = (i, 60+i)
+        w.live_curves["ph"]["filtered"].setData([0, 1, 100+i], [7, 8, 9])
+        p.apply(); app.processEvents(); p.menu.updateState()
+        assert low.text() == "1." and low.cursorPosition() == 1
+    assert p.manual[0]
+    high.setText("5")
+    QtTest.QTest.keyClick(low, C.Qt.Key.Key_Return)
+    assert p.x_query() == (1, 5)
+    low.setText("invalid"); p.menu.commit_range(0)
+    p.restore(); app.processEvents()
+    assert not any(p.menu.editing) and not low.styleSheet()
+    assert low.text() != "invalid"
+    submenu.close()
 
 
 def test_manual_query_reads_old_interval_and_discards_outdated_results(window, monkeypatch):

@@ -1,5 +1,14 @@
-# Validation status — 3.1.0
+# Validation status — 3.2.0
 
+
+## Version 3.2.0 acceptance (2026-11-05)
+
+- **298 automated tests passed**, including the complete previous suite and 23 additional range/input regressions. Physical serial access remains prohibited in automated tests. The 58 pyqtgraph deprecation warnings remain unchanged.
+- Actual Qt mouse/key events verify countdown increment/decrement buttons, limits, disabled controls, invalid drafts and strict ASCII integer validation. Invalid text survives refresh and cannot schedule feedback. Zero is allowed in either field, but not as the total duration.
+- Plot controls return to the compact native context menu. Tests cover focus while typing, cursor preservation during repeated refresh, invalid bounds, absolute timestamp precision, restore-auto, linked X axes, independent Y axes, old-interval queries, outdated query results and current-view export. Menu/action lifetimes are retained explicitly for the packaged Qt binding.
+- Bilingual countdown fixtures cover 100%, 125% and 150% scale, standard and narrower windows, pending, failed and invalid-input states. Plot fixtures confirm the extra bottom range toolbar is absent.
+- CQ Windows 3.1.0 inspection confirms live Metrohm pH acquisition on its dedicated adapter. PC8500 access is blocked by a separate Uni Bern EC Suite process that is currently recording. The pump adapter denies access without an identifiable user-process handle; Windows reports a reboot is required after a targeted adapter restart request. The ongoing external recording was not stopped. Neither a physical countdown activation nor small-dose injection is claimed until these conditions are resolved. Detailed local evidence is kept outside the public package.
+- Pump protocol, dosing rules, countdown service, filtering, temperature compensation, charge calculation and SQLite format are unchanged. Final portable-build, local-update and public-download results are recorded in the delivery report.
 
 ## Version 3.1.0 automated acceptance (2026-11-05)
 

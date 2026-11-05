@@ -24,7 +24,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     parts = tuple(map(int, __version__.split(".")))+(0,)
     resource = output/"version-info.txt"
-    resource.write_text(f'''VSVersionInfo(ffi=FixedFileInfo(filevers={parts!r}, prodvers={parts!r}, mask=0x3f, flags=0, OS=0x40004, fileType=0x1, subtype=0, date=(0,0)), kids=[StringFileInfo([StringTable('040904B0', [StringStruct('FileDescription','Electrolyte Manager'), StringStruct('FileVersion','{__version__}'), StringStruct('ProductName','Electrolyte Manager 3.1'), StringStruct('ProductVersion','{__version__}')])]), VarFileInfo([VarStruct('Translation',[1033,1200])])])''', encoding="utf-8")
+    resource.write_text(f'''VSVersionInfo(ffi=FixedFileInfo(filevers={parts!r}, prodvers={parts!r}, mask=0x3f, flags=0, OS=0x40004, fileType=0x1, subtype=0, date=(0,0)), kids=[StringFileInfo([StringTable('040904B0', [StringStruct('FileDescription','Electrolyte Manager'), StringStruct('FileVersion','{__version__}'), StringStruct('ProductName','Electrolyte Manager 3.2'), StringStruct('ProductVersion','{__version__}')])]), VarFileInfo([VarStruct('Translation',[1033,1200])])])''', encoding="utf-8")
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
                "--name", "ElectrolyteManager", "--version-file", str(resource),
                "--paths", str(SOURCE), "--add-data", str(SOURCE/"em2/resources")+";em2/resources",

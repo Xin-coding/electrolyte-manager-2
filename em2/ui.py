@@ -22,6 +22,7 @@ from .paths import atomic_json, read_json
 from .units import hydroxide
 from .chart_range import attach as attach_range
 from .countdown import confirmation_context, duration, status_text
+from .integer_input import IntegerInput
 
 pg.setConfigOptions(antialias=True, background="white", foreground="#17324d")
 
@@ -337,6 +338,8 @@ class Window(W.QMainWindow):
         for plot in plots:
             plot.range_control.set_language()
         self.update_conductivity_labels()
+
+        self.validate_countdown_input()
 
     def numeric_edits(self):
         return [*self.settings_edits().values(), *self.test_edits().values(), self.allowance]
@@ -788,13 +791,10 @@ class Window(W.QMainWindow):
         box.addLayout(row)
         delay_row = W.QHBoxLayout()
         delay_row.addWidget(self.label("反馈启动倒计时", "Delay feedback start"))
-        self.delay_hours = W.QSpinBox()
-        self.delay_hours.setRange(0, 999)
-        self.delay_hours.setMinimumWidth(85)
-        self.delay_minutes = W.QSpinBox()
-        self.delay_minutes.setRange(0, 59)
-        self.delay_minutes.setValue(1)
-        self.delay_minutes.setMinimumWidth(70)
+        self.delay_hours = IntegerInput(999)
+        self.delay_hours.setFixedWidth(106)
+        self.delay_minutes = IntegerInput(59, 1)
+        self.delay_minutes.setFixedWidth(92)
         delay_row.addWidget(self.delay_hours)
         delay_row.addWidget(self.label("小时", "h"))
         delay_row.addWidget(self.delay_minutes)
@@ -805,6 +805,13 @@ class Window(W.QMainWindow):
         delay_row.addWidget(self.cancel_schedule_button)
         delay_row.addStretch()
         box.addLayout(delay_row)
+        self.countdown_error = W.QLabel()
+        self.countdown_error.setObjectName("fieldError")
+        self.countdown_error.setWordWrap(True)
+        self.countdown_error.hide()
+        box.addWidget(self.countdown_error)
+        self.delay_hours.changed.connect(self.validate_countdown_input)
+        self.delay_minutes.changed.connect(self.validate_countdown_input)
         self.countdown_status = W.QLabel()
         self.countdown_status.setWordWrap(True)
         self.countdown_status.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -901,7 +908,29 @@ class Window(W.QMainWindow):
     def cancel_schedule(self):
         self.runtime.command("cancel_countdown", reservation_id=self.runtime.snapshot.get("countdown", {}).get("id"))
 
+    def validate_countdown_input(self):
+        errors = []
+        values = []
+        for edit in (self.delay_hours, self.delay_minutes):
+            try:
+                values.append(edit.value())
+                errors.append(False)
+            except ValueError:
+                values.append(0)
+                errors.append(True)
+        if not any(errors) and not any(values):
+            errors = [True, True]
+        for edit, error in zip((self.delay_hours, self.delay_minutes), errors):
+            edit.mark_invalid(error)
+        valid = not any(errors)
+        self.countdown_error.setText(("仅可输入 0–9 的整数数字：小时 0–999，分钟 0–59，总时长至少 1 分钟。" if self.language == "zh" else
+                                      "Use digits 0–9 only: hours 0–999, minutes 0–59; total delay must be at least 1 minute.") if not valid else "")
+        self.countdown_error.setVisible(not valid)
+        return valid
+
     def schedule_control(self):
+        if not self.validate_countdown_input():
+            return
         seconds = self.delay_hours.value()*3600+self.delay_minutes.value()*60
         if seconds < 60:
             raise ValueError("倒计时至少 1 分钟" if self.language == "zh" else "Countdown must be at least 1 minute")
@@ -1289,6 +1318,10 @@ class Window(W.QMainWindow):
             color = "#168a68" if connected else "#bb7c24" if bound else "#788b9a"
             connection_detail = (info.get("info", {}).get("serial_settings", "") if connected
                                  else info.get("error", ""))
+            if not connected and any(t in connection_detail.casefold() for t in ("access is denied", "permissionerror", "拒绝访问")):
+                connection_detail = ("串口被占用或访问被拒绝：请先断开其他软件中的该端口，再重连。" if zh else
+                                     "Port busy or access denied: disconnect this port in other software, then reconnect.")
+            state.setToolTip(info.get("error", "") if not connected else "")
             quality = s["samples"].get(kind, {}).get("quality", "valid")
             if connected and quality != "valid":
                 quality_text = {"sensor_disconnected": "探头未连接", "sensor_type_mismatch": "探头类型不匹配",
@@ -1305,7 +1338,7 @@ class Window(W.QMainWindow):
         countdown = s.get("countdown", {"state": "idle"})
         scheduled = countdown["state"] == "pending"
         self.pause_button.setEnabled(s["enabled"] or bool(s["active"]) or scheduled)
-        self.schedule_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"] and not s.get("finishing") and not scheduled)
+        self.schedule_button.setEnabled(s["recording"] and not s["enabled"] and not s["active"] and not s.get("finishing") and not scheduled and self.validate_countdown_input())
         self.cancel_schedule_button.setEnabled(scheduled)
         self.delay_hours.setEnabled(not scheduled)
         self.delay_minutes.setEnabled(not scheduled)

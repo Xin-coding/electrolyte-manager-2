@@ -1,6 +1,6 @@
-# Electrolyte Manager 3.1
+# Electrolyte Manager 3.2
 
-Current version: **3.1.0**. Record first and schedule feedback to start 1 minute to 999 hours 59 minutes later. Confirm the pump and syringe when scheduling; the service rechecks live conditions at the deadline without another dialog. Failed or missed starts never retry automatically. See [3.1 changes](docs/CHANGES_3_1_0.md). M80/PC8500 selection and chart controls from 3.0 remain available.
+Current version: **3.2.0**. Restores compact in-plot range menus, protects manual axis drafts from live refresh, and fixes countdown step buttons with visible integer validation. See [3.2 changes](docs/CHANGES_3_2_0.md). Delayed feedback and M80/PC8500 support remain available.
 
 Includes the complete 2.1.1 Metrohm CTS/DSR handshake repair, with serial parameters shown on Connections. Identified or occupied ports are not probed with other device protocols. Each sensor can read and record independently, without a pump. See [communication repair](docs/CHANGES_2_1_1.md).
 
