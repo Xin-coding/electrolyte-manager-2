@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,8 +32,16 @@ def main():
     for package in ("scipy", "matplotlib", "pandas", "pytest", "tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets"):
         command += ["--exclude-module", package]
     command.append(str(SOURCE/"tools/launcher.py"))
+    # Keep unrelated scientific tools / agent utilities out of DLL discovery.
+    # In particular an old app-local UCRT can break Qt before Python starts.
+    environment = os.environ.copy()
+    windows = Path(environment.get("WINDIR", "C:/Windows"))
+    environment["PATH"] = os.pathsep.join(map(str, (Path(sys.executable).parent, Path(sys.base_prefix),
+                                                   Path(sys.base_prefix)/"DLLs", windows/"System32", windows)))
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
     with (output/"build.log").open("w", encoding="utf-8") as log:
-        subprocess.run(command, cwd=SOURCE, stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(command, cwd=SOURCE, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
     app = output/"ElectrolyteManager"
     hashes = {}
     for file in sorted(app.rglob("*")):
