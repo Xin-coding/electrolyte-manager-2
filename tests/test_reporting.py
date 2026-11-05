@@ -17,7 +17,9 @@ from em2.ui import Window
 
 
 def experiment(folder, name="Report", purpose="experiment", amounts=(.1, .2, .3)):
-    store = storage.Store.create(folder, name, {})
+    # Load the complete synthetic chart fixture without depending on disk
+    # scheduling; bounded queue/overflow behavior has its own storage tests.
+    store = storage.Store.create(folder, name, {}, queue_size=max(10000, len(amounts)+10))
     total = 0.
     for i, amount in enumerate(amounts):
         total = total+amount if amount is not None and total is not None else None
